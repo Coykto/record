@@ -28,6 +28,15 @@ app = typer.Typer(help="record: privacy-first meeting recorder")
 _STOP_TIMEOUT_SECONDS = 10.0
 _STOP_POLL_INTERVAL = 0.1
 
+# Audio capture format. The Swift binary writes a WAV at exactly these
+# parameters; downstream transcription (Deepgram nova-3) is tuned for
+# 16 kHz / 16-bit / mono so we pin them here rather than exposing them as
+# user flags. The supervisor's argparse defaults match these values as a
+# backstop, but the CLI is the authoritative source.
+_SAMPLE_RATE = 16000
+_BIT_DEPTH = 16
+_CHANNELS = 1
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -87,13 +96,15 @@ def _summarize_sources(state_dict: dict[str, Any]) -> str:
         return "microphone + system audio"
     if mic_status == "attached" and sysa_status == "lost":
         return (
-            f"microphone only - system audio dropped at "
-            f"{_format_offset(lost_offsets.get('system_audio'))}"
+            f"system audio dropped at "
+            f"{_format_offset(lost_offsets.get('system_audio'))} "
+            f"— remainder is microphone only"
         )
     if mic_status == "lost" and sysa_status == "attached":
         return (
-            f"system audio only - microphone dropped at "
-            f"{_format_offset(lost_offsets.get('mic'))}"
+            f"microphone dropped at "
+            f"{_format_offset(lost_offsets.get('mic'))} "
+            f"— remainder is system audio only"
         )
     if mic_status == "attached":
         return "microphone only"
@@ -148,7 +159,9 @@ def start() -> None:
     # a fully qualified path even if its CWD differs from ours.
     output_path = (Path.cwd() / f"{_filename_timestamp()}.wav").resolve()
 
-    # Spawn the supervisor fully detached from this terminal.
+    # Spawn the supervisor fully detached from this terminal. Format params
+    # are passed explicitly so the CLI owns the capture-format decision; the
+    # supervisor forwards them verbatim into the `start` IPC command.
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -156,6 +169,12 @@ def start() -> None:
             "record.supervisor",
             "--output-path",
             str(output_path),
+            "--sample-rate",
+            str(_SAMPLE_RATE),
+            "--bit-depth",
+            str(_BIT_DEPTH),
+            "--channels",
+            str(_CHANNELS),
         ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,

@@ -1,16 +1,14 @@
 import Foundation
-// Imports retained as build-time checks for the SDK frameworks slice 3 will use.
-// They are unused in this stub; do not remove.
-import ScreenCaptureKit
-import AVFoundation
-import CoreAudio
-import AppKit
 
 // MARK: - Stdout: line-buffered, single-line JSON events
 
 // Force line-buffered stdout so the Python supervisor sees each event as soon
 // as it's written. macOS defaults to block-buffered when stdout is a pipe.
 setvbuf(stdout, nil, _IOLBF, 0)
+
+/// Lock around `FileHandle.standardOutput` so events emitted from SCStream
+/// callback threads and the main thread don't interleave bytes on the wire.
+let stdoutLock = NSLock()
 
 /// Write a single event as one JSON line followed by `\n`, then flush.
 @inline(__always)
@@ -20,13 +18,18 @@ func emit(_ event: Event) {
         // Defensive: encoder shouldn't produce embedded newlines, but if some
         // future field ever did, collapse them so the line protocol stays intact.
         let safe = line.replacingOccurrences(of: "\n", with: " ")
+        stdoutLock.lock()
         FileHandle.standardOutput.write(Data((safe + "\n").utf8))
+        fflush(stdout)
+        stdoutLock.unlock()
     } catch {
         // Last-ditch fallback so we don't drop the protocol entirely.
         let fallback = #"{"event":"error","message":"event encode failed"}"# + "\n"
+        stdoutLock.lock()
         FileHandle.standardOutput.write(Data(fallback.utf8))
+        fflush(stdout)
+        stdoutLock.unlock()
     }
-    fflush(stdout)
 }
 
 // MARK: - Time formatting
@@ -39,12 +42,19 @@ let iso8601: ISO8601DateFormatter = {
     return f
 }()
 
-// MARK: - Capture state (stub)
+// MARK: - Capture state
 
 /// In-flight capture state. `nil` between `start` and `stop`.
-struct CaptureState {
-    let startMonotonic: Date
+final class CaptureState {
+    let capture: AudioCapture
     let outputPath: String
+    let startedAt: Date
+
+    init(capture: AudioCapture, outputPath: String, startedAt: Date) {
+        self.capture = capture
+        self.outputPath = outputPath
+        self.startedAt = startedAt
+    }
 }
 
 var capture: CaptureState? = nil
@@ -61,16 +71,49 @@ sigtermSource.setEventHandler {
 }
 sigtermSource.resume()
 
-// MARK: - Stdin command loop
+// MARK: - Command handlers
 
 func handleStart(outputPath: String, format _: AudioFormat) {
-    // Stub: do not actually open audio sources or write a file.
-    let now = Date()
-    capture = CaptureState(startMonotonic: now, outputPath: outputPath)
+    if capture != nil {
+        emit(.error(message: "start received while capture is already running"))
+        return
+    }
 
-    emit(.started(startTime: iso8601.string(from: now)))
-    emit(.sourceAttached(source: .mic))
-    emit(.sourceAttached(source: .systemAudio))
+    let url = URL(fileURLWithPath: outputPath)
+
+    let audioCapture: AudioCapture
+    do {
+        audioCapture = try AudioCapture(outputURL: url, emit: emit)
+    } catch {
+        emit(.error(message: "failed to construct AudioCapture: \(error)"))
+        exit(1)
+    }
+
+    let startedAt = Date()
+    capture = CaptureState(
+        capture: audioCapture,
+        outputPath: outputPath,
+        startedAt: startedAt
+    )
+
+    Task {
+        do {
+            // Protocol-required ordering on the wire is:
+            //   (permission_required*) → started → source_attached(*) → … → stopped
+            //
+            // The permission preflights may emit `permission_required` /
+            // `permission_denied` events, so they must run *before* `started`.
+            // Each source self-emits its own `source_attached` event as soon
+            // as its underlying engine/stream is producing audio, so those
+            // must run *after* `started`.
+            try await audioCapture.checkPermissions()
+            emit(.started(startTime: iso8601.string(from: startedAt)))
+            try await audioCapture.startSources()
+        } catch {
+            emit(.error(message: "capture start failed: \(error)"))
+            exit(1)
+        }
+    }
 }
 
 func handleStop() {
@@ -80,40 +123,59 @@ func handleStop() {
         emit(.error(message: "stop received before start"))
         return
     }
-    let duration = Date().timeIntervalSince(state.startMonotonic)
-    emit(.stopped(durationSeconds: duration, outputPath: state.outputPath))
-    // Supervisor expects the binary to exit on its own after `stop`.
-    exit(0)
-}
 
-// 1. Announce readiness immediately on startup.
-emit(.ready)
-
-// 2. Blocking, line-oriented read loop on stdin. `readLine()` strips the
-//    trailing newline and returns nil on EOF.
-while let line = readLine(strippingNewline: true) {
-    // Skip blank lines silently — they're not malformed, just noise.
-    let trimmed = line.trimmingCharacters(in: .whitespaces)
-    if trimmed.isEmpty { continue }
-
-    let command: Command
-    do {
-        command = try IPCCodec.decodeCommand(line: trimmed)
-    } catch {
-        emit(.error(message: "malformed command: \(error.localizedDescription)"))
-        continue
-    }
-
-    switch command {
-    case .start(let outputPath, let format):
-        handleStart(outputPath: outputPath, format: format)
-    case .stop:
-        handleStop()
-    case .shutdown:
-        // Clean exit, no `stopped` event.
+    Task {
+        let duration = await state.capture.stop()
+        emit(.stopped(durationSeconds: duration, outputPath: state.outputPath))
         exit(0)
     }
 }
 
-// EOF on stdin: treat as a clean shutdown so we don't linger as a zombie.
-exit(0)
+// MARK: - Stdin reader
+
+/// The stdin reader runs on a background thread so the main thread is free for
+/// the RunLoop that backs `Task` and SCStream's async work. `readLine()` is
+/// blocking and would otherwise stall the main RunLoop, leaving the capture
+/// task no chance to make progress.
+let stdinThread = Thread {
+    // Announce readiness immediately on startup.
+    emit(.ready)
+
+    while let line = readLine(strippingNewline: true) {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { continue }
+
+        let command: Command
+        do {
+            command = try IPCCodec.decodeCommand(line: trimmed)
+        } catch {
+            emit(.error(message: "malformed command: \(error.localizedDescription)"))
+            continue
+        }
+
+        // Dispatch onto the main queue so handlers observe a consistent
+        // capture-state view and so `Task`s they spawn join the main
+        // RunLoop's executor.
+        DispatchQueue.main.async {
+            switch command {
+            case .start(let outputPath, let format):
+                handleStart(outputPath: outputPath, format: format)
+            case .stop:
+                handleStop()
+            case .shutdown:
+                exit(0)
+            }
+        }
+    }
+
+    // EOF on stdin: treat as a clean shutdown so we don't linger as a zombie.
+    DispatchQueue.main.async {
+        exit(0)
+    }
+}
+stdinThread.name = "record.stdin"
+stdinThread.start()
+
+// Drive the main RunLoop so dispatched work, SCStream callbacks delivered to
+// the main queue, and the SIGTERM source all get to run.
+RunLoop.main.run()

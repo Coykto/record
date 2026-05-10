@@ -158,6 +158,11 @@ def _apply_event(current: dict[str, Any], event: ipc.Event) -> dict[str, Any]:
 
     if isinstance(event, ipc.SourceLostEvent):
         src = current["sources"][event.source]
+        # Idempotency: the first loss is the one that matters. If the binary
+        # ever re-emits source_lost for an already-lost source, ignore it so
+        # we don't overwrite lost_at or duplicate the warning entry.
+        if src.get("status") == "lost":
+            return current
         src["status"] = "lost"
         src["lost_at"] = now
         current["warnings"].append(
