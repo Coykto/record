@@ -9,5 +9,11 @@ swift:
 install: swift
 	uv pip install -e .
 
-test:
-	@echo "tests not implemented yet"
+test: swift
+	@echo "=== Python tests ==="
+	uv run pytest tests
+	@echo "=== Swift tests ==="
+	@case "$$(xcode-select -p 2>/dev/null)" in \
+		*/Xcode.app/*) swift test --package-path swift-capture ;; \
+		*) echo "swift test skipped: XCTest unavailable -- install full Xcode to enable Swift unit tests" ;; \
+	esac

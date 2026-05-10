@@ -42,6 +42,36 @@ let iso8601: ISO8601DateFormatter = {
     return f
 }()
 
+// MARK: - CLI argument parsing
+
+/// Parse CLI flags before any IPC begins. The only supported flag right now is
+/// `--test-silent-sources`, which swaps the real `SCStream` / `AVAudioEngine`
+/// sources for a deterministic synthetic feeder (Slice 7). Unknown flags emit
+/// a single `error` event and exit non-zero, so the Python supervisor sees a
+/// predictable failure rather than a hung process.
+func parseCLIFlags() -> Bool {
+    var testSilent = false
+    // CommandLine.arguments[0] is the executable path.
+    let args = Array(CommandLine.arguments.dropFirst())
+    for arg in args {
+        switch arg {
+        case "--test-silent-sources":
+            testSilent = true
+        default:
+            // Emit directly to stdout; the lock-protected `emit` helper isn't
+            // strictly required here (we're still single-threaded), but use
+            // the same path for consistency.
+            let line = #"{"event":"error","message":"unknown CLI flag: "# + arg + #""}"# + "\n"
+            FileHandle.standardOutput.write(Data(line.utf8))
+            fflush(stdout)
+            exit(1)
+        }
+    }
+    return testSilent
+}
+
+let testSilentSources = parseCLIFlags()
+
 // MARK: - Capture state
 
 /// In-flight capture state. `nil` between `start` and `stop`.
@@ -83,7 +113,11 @@ func handleStart(outputPath: String, format _: AudioFormat) {
 
     let audioCapture: AudioCapture
     do {
-        audioCapture = try AudioCapture(outputURL: url, emit: emit)
+        audioCapture = try AudioCapture(
+            outputURL: url,
+            emit: emit,
+            testSilentSources: testSilentSources
+        )
     } catch {
         emit(.error(message: "failed to construct AudioCapture: \(error)"))
         exit(1)

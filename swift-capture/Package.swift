@@ -13,6 +13,12 @@ let package = Package(
         .executableTarget(
             name: "RecordCapture",
             path: "Sources/RecordCapture"
+        ),
+        .testTarget(
+            name: "RecordCaptureTests",
+            dependencies: ["RecordCapture"],
+            path: "Tests/RecordCaptureTests",
+            resources: [.copy("Fixtures")]
         )
     ]
 )

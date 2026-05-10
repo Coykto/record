@@ -148,9 +148,27 @@ final class AudioCapture: NSObject {
     /// plenty small to keep WAV latency negligible without burning CPU.
     private let drainIntervalMs: Int = 10
 
-    init(outputURL: URL, emit: @escaping (Event) -> Void) throws {
+    // --- Test mode (Slice 7) ---
+    //
+    // When `testSilentSources == true` the real SCStream + AVAudioEngine paths
+    // are entirely bypassed and a deterministic synthetic feeder appends
+    // int16 samples directly to micQueue and systemQueue. No TCC permissions
+    // are touched. The mixer pump then drains/mixes/writes the WAV unchanged.
+    private let testSilentSources: Bool
+    private var syntheticQueue: DispatchQueue?
+    private var syntheticTimer: DispatchSourceTimer?
+    /// Frame index of the next synthetic sample to emit. Used to derive the
+    /// 1 s silence + 1 s 440 Hz tone loop deterministically across ticks.
+    private var syntheticFrameIndex: Int = 0
+
+    init(
+        outputURL: URL,
+        emit: @escaping (Event) -> Void,
+        testSilentSources: Bool = false
+    ) throws {
         self.outputURL = outputURL
         self.emit = emit
+        self.testSilentSources = testSilentSources
         self.wavWriter = try WAVWriter(url: outputURL)
         super.init()
     }
@@ -166,6 +184,13 @@ final class AudioCapture: NSObject {
     /// permission preflights may emit `permission_required` events and the
     /// protocol requires those to come before `started`.
     func checkPermissions() async throws {
+        // Test mode: skip TCC entirely. No `permission_required` or
+        // `permission_denied` events are emitted, and no SCK / AVCaptureDevice
+        // APIs are touched — so the binary can run in CI without prompting.
+        if testSilentSources {
+            return
+        }
+
         let screenGranted = await Permissions.checkScreenRecording(emit: emit)
         guard screenGranted else {
             throw AudioCaptureError.permissionDenied
@@ -185,6 +210,19 @@ final class AudioCapture: NSObject {
     /// source self-emits its `source_attached` event from here, and the
     /// protocol requires those to come after `started`.
     func startSources() async throws {
+        if testSilentSources {
+            // Test mode: feed both ring buffers from a deterministic synthetic
+            // stream. Emit source_attached events in the same order as the
+            // real path (mic first, then system_audio) so the protocol order
+            // on the wire is indistinguishable.
+            emit(.sourceAttached(source: .mic))
+            emit(.sourceAttached(source: .systemAudio))
+            startedAt = Date()
+            startSyntheticFeeder()
+            startMixerPump()
+            return
+        }
+
         // Mic first: cheaper to bring up and gives the user audible feedback
         // sooner if they're testing the pipeline.
         try startMic()
@@ -198,6 +236,17 @@ final class AudioCapture: NSObject {
     /// the WAV, finalize the WAV, return elapsed seconds since `start()`
     /// returned.
     func stop() async -> Double {
+        if testSilentSources {
+            // Test mode: no real sources were ever started; just halt the
+            // synthetic feeder, drain the mixer one last time, and finalize.
+            stopSyntheticFeeder()
+            stopMixerPump()
+            drainAndMix(finalFlush: true)
+            wavWriter.close()
+            guard let startedAt = startedAt else { return 0 }
+            return Date().timeIntervalSince(startedAt)
+        }
+
         // Drop the engine-config observer before tearing anything down: once
         // we stop the engine ourselves, AVAudioEngine may post a final
         // notification we don't want to misinterpret as a mid-capture loss.
@@ -484,6 +533,72 @@ final class AudioCapture: NSObject {
     private func stopMixerPump() {
         mixerTimer?.cancel()
         mixerTimer = nil
+    }
+
+    // MARK: - Synthetic feeder (test mode, Slice 7)
+
+    /// Drive both ring buffers from a deterministic timer.
+    ///
+    /// Pattern: 1 s of silence followed by 1 s of a 440 Hz sine tone, looped
+    /// (period = 32000 frames at 16 kHz). Each tick appends ~160 samples per
+    /// source. Choice: silence is fed into `micQueue` and the tone is fed
+    /// into `systemQueue`, so the mixed WAV contains a recognizable 1-on /
+    /// 1-off tone pattern coming exclusively from the system-audio side —
+    /// which makes "did the system_audio path reach the mixer?" trivially
+    /// observable in CI.
+    private func startSyntheticFeeder() {
+        let q = DispatchQueue(label: "record.audiocapture.synthetic", qos: .userInitiated)
+        let timer = DispatchSource.makeTimerSource(queue: q)
+        // ~160 frames per 10 ms at 16 kHz. Match the mixer pump cadence so the
+        // queues stay shallow.
+        let framesPerTick = 160
+        timer.schedule(
+            deadline: .now() + .milliseconds(drainIntervalMs),
+            repeating: .milliseconds(drainIntervalMs)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.tickSyntheticFeeder(framesPerTick: framesPerTick)
+        }
+        syntheticQueue = q
+        syntheticTimer = timer
+        syntheticFrameIndex = 0
+        timer.resume()
+    }
+
+    private func stopSyntheticFeeder() {
+        syntheticTimer?.cancel()
+        syntheticTimer = nil
+        syntheticQueue = nil
+    }
+
+    /// Generate the next `framesPerTick` int16 samples for each side and
+    /// enqueue them. Deterministic w.r.t. `syntheticFrameIndex` so test
+    /// assertions can predict the waveform exactly.
+    private func tickSyntheticFeeder(framesPerTick: Int) {
+        let sampleRate = 16000.0
+        let toneHz = 440.0
+        // Peak amplitude well below int16 full-scale to leave headroom for
+        // the mixer's clamped sum; matches the spec's "~0.5 of full-scale".
+        let amplitude: Double = 16000.0
+        let periodFrames = 32000 // 1 s silence + 1 s tone, looped
+
+        let micSamples = [Int16](repeating: 0, count: framesPerTick)
+        var sysSamples = [Int16](repeating: 0, count: framesPerTick)
+
+        for i in 0..<framesPerTick {
+            let frame = (syntheticFrameIndex + i) % periodFrames
+            // First half (0..16000): silence. Second half (16000..32000): tone.
+            if frame >= 16000 {
+                let toneFrame = Double(frame - 16000)
+                let s = sin(2.0 * .pi * toneHz * toneFrame / sampleRate)
+                sysSamples[i] = Int16(clamping: Int(amplitude * s))
+            }
+            // micSamples stays zero (silence) for the entire pattern.
+        }
+        syntheticFrameIndex += framesPerTick
+
+        micSamples.withUnsafeBufferPointer { micQueue.append($0) }
+        sysSamples.withUnsafeBufferPointer { systemQueue.append($0) }
     }
 
     /// Pull whatever's available from each ring buffer, pad the shorter side

@@ -34,7 +34,7 @@ class CaptureAlreadyRunning(RuntimeError):
     """
 
     def __init__(self, existing_pid: int) -> None:
-        super().__init__(f"capture already in progress (pid {existing_pid})")
+        super().__init__(f"capture already in progress (PID {existing_pid})")
         self.existing_pid = existing_pid
 
 

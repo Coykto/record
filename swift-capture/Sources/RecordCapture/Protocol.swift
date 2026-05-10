@@ -217,6 +217,18 @@ enum IPCCodec {
         return s
     }
 
+    /// Serialize a `Command` to a single-line JSON string (no trailing newline).
+    ///
+    /// Provided for symmetry with the Python `serialize_command` helper so the
+    /// Swift test suite can round-trip the shared command fixtures.
+    static func encode(_ command: Command) throws -> String {
+        let data = try encoder.encode(command)
+        guard let s = String(data: data, encoding: .utf8) else {
+            throw IPCCodecError.invalidUTF8
+        }
+        return s
+    }
+
     /// Parse a single JSON-line into a `Command`. Throws on malformed input
     /// or unknown command discriminator.
     static func decodeCommand(line: String) throws -> Command {
@@ -224,6 +236,15 @@ enum IPCCodec {
             throw IPCCodecError.invalidUTF8
         }
         return try decoder.decode(Command.self, from: data)
+    }
+
+    /// Parse a single JSON-line into an `Event`. Symmetric counterpart to
+    /// `encode(_ event:)`; used by the test suite to round-trip event fixtures.
+    static func decode(eventLine line: String) throws -> Event {
+        guard let data = line.data(using: .utf8) else {
+            throw IPCCodecError.invalidUTF8
+        }
+        return try decoder.decode(Event.self, from: data)
     }
 }
 

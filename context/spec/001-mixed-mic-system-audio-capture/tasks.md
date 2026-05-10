@@ -60,27 +60,27 @@ Goal: if mic or system audio drops mid-capture, the other continues, the warning
 
 Goal: every CLI exit code path from tech spec §2.4 behaves correctly with clear messages.
 
-- [ ] **Slice 6: Error paths**
-  - [ ] `record start` while a capture is already running: confirm PID is alive, exit 1 with `"capture already in progress (PID <n>)"`. **[Agent: python-backend]**
-  - [ ] `record start` with a stale PID file (PID not alive): silently clean up and proceed normally. **[Agent: python-backend]**
-  - [ ] `record stop` with no PID file or stale PID file: exit 1 with `"no capture running"`. **[Agent: python-backend]**
-  - [ ] Permission-denied flow: when supervisor receives `permission_denied` event from the daemon, log it, leave a marker in `capture-state.json`, exit 2 with a user-facing message naming the System Settings panel (e.g., `"microphone permission denied — grant access in System Settings → Privacy & Security → Microphone"`). **[Agent: python-backend]**
-  - [ ] Binary-not-found / launch failure: if `subprocess.Popen` of `record-capture` raises, exit 3 with a clear message pointing at `make install`. **[Agent: python-backend]**
-  - [ ] Supervisor did-not-exit-cleanly: in `record stop`, if SIGTERM + wait times out, exit 4 with a message telling the user to inspect `daemon.log`. Force-kill is NOT used — leave the process for the user to inspect. **[Agent: python-backend]**
-  - [ ] **Verification:** Shell-script through every exit code: (1) start twice in a row → second exits 1; (2) `kill -9` the supervisor then `record stop` → exits 1 with stale-PID message; (3) `rm` the bundled binary then `record start` → exits 3; (4) revoke microphone permission in System Settings then `record start` → exits 2 with the System Settings message; (5) confirm exit codes via `echo $?` after each. **[Agent: python-backend]**
+- [x] **Slice 6: Error paths**
+  - [x] `record start` while a capture is already running: confirm PID is alive, exit 1 with `"capture already in progress (PID <n>)"`. **[Agent: python-backend]**
+  - [x] `record start` with a stale PID file (PID not alive): silently clean up and proceed normally. **[Agent: python-backend]**
+  - [x] `record stop` with no PID file or stale PID file: exit 1 with `"no capture running"`. **[Agent: python-backend]**
+  - [x] Permission-denied flow: when supervisor receives `permission_denied` event from the daemon, log it, leave a marker in `capture-state.json`, exit 2 with a user-facing message naming the System Settings panel (e.g., `"microphone permission denied — grant access in System Settings → Privacy & Security → Microphone"`). **[Agent: python-backend]**
+  - [x] Binary-not-found / launch failure: if `subprocess.Popen` of `record-capture` raises, exit 3 with a clear message pointing at `make install`. **[Agent: python-backend]**
+  - [x] Supervisor did-not-exit-cleanly: in `record stop`, if SIGTERM + wait times out, exit 4 with a message telling the user to inspect `daemon.log`. Force-kill is NOT used — leave the process for the user to inspect. **[Agent: python-backend]**
+  - [x] **Verification:** Shell-script through every exit code: (1) start twice in a row → second exits 1; (2) `kill -9` the supervisor then `record stop` → exits 1 with stale-PID message; (3) `rm` the bundled binary then `record start` → exits 3; (4) revoke microphone permission in System Settings then `record start` → exits 2 with the System Settings message; (5) confirm exit codes via `echo $?` after each. **[Agent: python-backend]**
 
 ## Slice 7 — Automated tests, CI test mode, and README
 
 Goal: the slice's verification is no longer purely manual. `make test` runs unit + integration tests; the integration test exercises the real Swift binary against a synthetic source.
 
-- [ ] **Slice 7: Tests & docs**
-  - [ ] Add `--test-silent-sources` flag to the Swift binary that bypasses `SCStream` and `AVAudioEngine` and feeds the mixer with deterministic synthetic buffers (1 s silence + 1 s 440 Hz tone, looped). No TCC permissions required. Mode is opt-in via the flag only. **[Agent: macos-swift]**
-  - [ ] Python unit tests under `tests/python/`: `test_ipc.py` (round-trip every command/event through pydantic; reject malformed lines), `test_state.py` (PID create/stale/cleanup; state-file atomic writes), `test_cli.py` (Typer `CliRunner` against a stub supervisor binary that emits scripted JSON lines; covers all exit codes from slice 6), `test_paths.py`. **[Agent: python-backend]**
-  - [ ] Swift unit tests under `swift-capture/Tests/`: `ProtocolTests.swift` (Codable round-trip against shared JSON fixtures), `StateFileTests.swift` (atomic write under concurrent dispatch). **[Agent: macos-swift]**
-  - [ ] Integration test under `tests/integration/test_end_to_end.py`: spawns the real `record-capture` binary with `--test-silent-sources` for ~2 s, verifies the JSON-line event sequence (`ready` → `started` → 2× `source_attached` → `stopped`), opens the resulting WAV with Python's `wave` module and asserts mono/16 kHz/16-bit and duration within ±100 ms. **[Agent: python-backend]**
-  - [ ] Update `make test` to run `pytest tests/` and `swift test` from `swift-capture/`. **[Agent: general-purpose]**
-  - [ ] Add a short `README.md` (or update an existing one) with: installation (`make install`), first-run permission flow (Mic + Screen Recording prompts), the manual smoke test (start → talk + play audio → stop → play resulting WAV), troubleshooting (where to find `daemon.log` / `orchestrator.log`, how to check `capture-state.json`). **[Agent: general-purpose]**
-  - [ ] **Verification:** Run `make test` from a clean checkout — all unit and integration tests pass without requiring any TCC permissions. Manually re-run the slice 4 smoke test from the README's steps and confirm everything still works end-to-end. **[Agent: python-backend]**
+- [x] **Slice 7: Tests & docs**
+  - [x] Add `--test-silent-sources` flag to the Swift binary that bypasses `SCStream` and `AVAudioEngine` and feeds the mixer with deterministic synthetic buffers (1 s silence + 1 s 440 Hz tone, looped). No TCC permissions required. Mode is opt-in via the flag only. **[Agent: macos-swift]**
+  - [x] Python unit tests under `tests/python/`: `test_ipc.py` (round-trip every command/event through pydantic; reject malformed lines), `test_state.py` (PID create/stale/cleanup; state-file atomic writes), `test_cli.py` (Typer `CliRunner` against a stub supervisor binary that emits scripted JSON lines; covers all exit codes from slice 6), `test_paths.py`. **[Agent: python-backend]**
+  - [x] Swift unit tests under `swift-capture/Tests/`: `ProtocolTests.swift` (Codable round-trip against shared JSON fixtures), `StateFileTests.swift` (atomic write under concurrent dispatch). **[Agent: macos-swift]**
+  - [x] Integration test under `tests/integration/test_end_to_end.py`: spawns the real `record-capture` binary with `--test-silent-sources` for ~2 s, verifies the JSON-line event sequence (`ready` → `started` → 2× `source_attached` → `stopped`), opens the resulting WAV with Python's `wave` module and asserts mono/16 kHz/16-bit and duration within ±100 ms. **[Agent: python-backend]**
+  - [x] Update `make test` to run `pytest tests/` and `swift test` from `swift-capture/`. **[Agent: general-purpose]**
+  - [x] Add a short `README.md` (or update an existing one) with: installation (`make install`), first-run permission flow (Mic + Screen Recording prompts), the manual smoke test (start → talk + play audio → stop → play resulting WAV), troubleshooting (where to find `daemon.log` / `orchestrator.log`, how to check `capture-state.json`). **[Agent: general-purpose]**
+  - [x] **Verification:** Run `make test` from a clean checkout — all unit and integration tests pass without requiring any TCC permissions. Manually re-run the slice 4 smoke test from the README's steps and confirm everything still works end-to-end. **[Agent: python-backend]**
 
 ---
 
