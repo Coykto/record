@@ -10,7 +10,7 @@ _The MVP — reliable manual capture that the consultant persona can adopt for d
 
 - [ ] **Capture Foundation**
   - [ ] **Hotkey-triggered background daemon:** A global hotkey starts and stops capture from a daemon already running in the background — no menu bar UI, no app window.
-  - [ ] **Active meeting window video capture:** Record only the meeting app's window (Zoom / Meet / Teams) to an `.mp4`, not the full screen.
+  - [ ] **Primary-display video capture:** Record the user's primary display (the one with the menu bar) to an `.mp4`, paired with the audio file from the same capture session.
   - [ ] **Mixed mic + system audio capture:** Capture the user's microphone and the system's audio output as a single mixed audio file (`.wav` / `.m4a`) suitable for transcription.
   - [ ] **Local folder output with predictable naming:** Write video and audio to a user-configured local folder using a stable naming convention (timestamp-based) so artifacts are easy to find without an in-app library.
 
@@ -23,6 +23,9 @@ _The MVP — reliable manual capture that the consultant persona can adopt for d
 ### Phase 2
 
 _With daily use proven, remove the manual hotkey friction so capture happens automatically when a meeting starts._
+
+- [ ] **Precision Video Capture**
+  - [ ] **Active meeting window video capture:** Record only the meeting app's window (Zoom / Meet / Teams) to an `.mp4`, instead of the full primary display. Replaces the Phase 1 primary-display capture once per-window tracking is reliable across the three meeting clients.
 
 - [ ] **Frictionless Capture**
   - [ ] **Meeting auto-detection (Zoom, Google Meet, Microsoft Teams):** Detect when a meeting starts on the three primary platforms and trigger capture automatically — without joining the meeting or appearing inside the meeting client. **This is the must-have for Phase 2.**
