@@ -1,2 +1,5 @@
 .venv
 .idea
+src/record/bin/
+src/record.egg-info/
+swift-capture/.build/

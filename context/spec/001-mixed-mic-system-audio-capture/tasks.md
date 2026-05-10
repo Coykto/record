@@ -4,11 +4,11 @@
 
 Goal: both binaries build and install; the CLI exists (commands stubbed); the Swift binary runs and prints a version string.
 
-- [ ] **Slice 1: Build scaffolding**
-  - [ ] Create `src/record/` Python package layout (`__init__.py`, `cli.py` with empty Typer app exposing no-op `start` and `stop` subcommands), update `pyproject.toml` to add `typer`, `pydantic`, `structlog` deps and the `[project.scripts] record = "record.cli:app"` entry point. **[Agent: python-backend]**
-  - [ ] Create `swift-capture/` Swift package: `Package.swift` targeting macOS 13+, `Sources/RecordCapture/main.swift` that just prints a version string and exits. Include the `ScreenCaptureKit`, `AVFoundation`, `CoreAudio`, `AppKit` framework imports as a build-time check. **[Agent: macos-swift]**
-  - [ ] Add `Makefile` at repo root with `make swift` (runs `swift build -c release` in `swift-capture/`, copies binary to `src/record/bin/record-capture`, chmods +x), `make install` (`make swift` + `uv pip install -e .`), and a placeholder `make test`. Add `src/record/bin/` to `.gitignore`. **[Agent: general-purpose]**
-  - [ ] **Verification:** Run `make install`. Run `record --help` and confirm both `start` and `stop` subcommands appear. Run `src/record/bin/record-capture` directly and confirm version line is printed. **[Agent: python-backend]**
+- [x] **Slice 1: Build scaffolding**
+  - [x] Create `src/record/` Python package layout (`__init__.py`, `cli.py` with empty Typer app exposing no-op `start` and `stop` subcommands), update `pyproject.toml` to add `typer`, `pydantic`, `structlog` deps and the `[project.scripts] record = "record.cli:app"` entry point. **[Agent: python-backend]**
+  - [x] Create `swift-capture/` Swift package: `Package.swift` targeting macOS 13+, `Sources/RecordCapture/main.swift` that just prints a version string and exits. Include the `ScreenCaptureKit`, `AVFoundation`, `CoreAudio`, `AppKit` framework imports as a build-time check. **[Agent: macos-swift]**
+  - [x] Add `Makefile` at repo root with `make swift` (runs `swift build -c release` in `swift-capture/`, copies binary to `src/record/bin/record-capture`, chmods +x), `make install` (`make swift` + `uv pip install -e .`), and a placeholder `make test`. Add `src/record/bin/` to `.gitignore`. **[Agent: general-purpose]**
+  - [x] **Verification:** Run `make install`. Run `record --help` and confirm both `start` and `stop` subcommands appear. Run `src/record/bin/record-capture` directly and confirm version line is printed. **[Agent: python-backend]**
 
 ## Slice 2 — End-to-end seam works with a stub Swift binary (no real audio)
 
