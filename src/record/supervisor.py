@@ -112,6 +112,7 @@ def _initial_state(supervisor_pid: int) -> dict[str, Any]:
         "pid": supervisor_pid,
         "start_time": None,
         "output_path": None,
+        "video_output_path": None,
         "sources": {
             "mic": {
                 "status": "never_attached",
@@ -123,8 +124,19 @@ def _initial_state(supervisor_pid: int) -> dict[str, Any]:
                 "attached_at": None,
                 "lost_at": None,
             },
+            "video": {
+                "status": "never_attached",
+                "attached_at": None,
+                "lost_at": None,
+                "display_id": None,
+                "width_px": None,
+                "height_px": None,
+                "fps": None,
+            },
         },
         "warnings": [],
+        "display_changes": [],
+        "ended_by": None,
         "last_event_at": _utcnow_iso(),
         "final": False,
     }
@@ -209,6 +221,59 @@ def _apply_event(current: dict[str, Any], event: ipc.Event) -> dict[str, Any]:
         current["output_path"] = event.output_path
         return current
 
+    if isinstance(event, ipc.VideoStartedEvent):
+        video = current["sources"]["video"]
+        video["status"] = "attached"
+        video["attached_at"] = now
+        video["display_id"] = event.display_id
+        video["width_px"] = event.width_px
+        video["height_px"] = event.height_px
+        video["fps"] = event.fps
+        return current
+
+    if isinstance(event, ipc.VideoLostEvent):
+        video = current["sources"]["video"]
+        # Idempotency: mirror SourceLostEvent — the first loss is the one that
+        # matters; later duplicates are silently dropped.
+        if video.get("status") == "lost":
+            return current
+        video["status"] = "lost"
+        video["lost_at"] = now
+        current["warnings"].append(
+            {
+                "timestamp": now,
+                "source": "video",
+                "message": event.reason,
+                "at_offset_seconds": event.at_offset_seconds,
+            }
+        )
+        return current
+
+    if isinstance(event, ipc.VideoFileEvent):
+        # Trust the binary's reported path on `video_file`, similar to how
+        # StoppedEvent overrides output_path.
+        current["video_output_path"] = event.path
+        current["video_file_duration_seconds"] = event.duration_seconds
+        return current
+
+    if isinstance(event, ipc.DisplayReconfiguredEvent):
+        current["display_changes"].append(
+            {
+                "timestamp": now,
+                "reason": event.reason,
+                "new_display_id": event.new_display_id,
+                "new_width_px": event.new_width_px,
+                "new_height_px": event.new_height_px,
+            }
+        )
+        return current
+
+    if isinstance(event, ipc.CaptureEndedBySystemEventEvent):
+        # Real summary-writing into orchestrator.log happens in a later slice;
+        # for now we just record the reason so `record stop` can surface it.
+        current["ended_by"] = event.reason
+        return current
+
     return current
 
 
@@ -239,7 +304,13 @@ def _log_event(event: ipc.Event) -> None:
         _log.info(name, **payload)
 
 
-def run(output_path: Path, sample_rate: int, bit_depth: int, channels: int) -> int:
+def run(
+    output_path: Path,
+    sample_rate: int,
+    bit_depth: int,
+    channels: int,
+    video_output_path: Path | None = None,
+) -> int:
     """Main supervisor entry point. Returns the desired process exit code."""
     configure_logging()
     paths.ensure_dirs()
@@ -269,6 +340,7 @@ def run(output_path: Path, sample_rate: int, bit_depth: int, channels: int) -> i
         "supervisor_starting",
         binary=str(binary),
         output_path=str(output_path),
+        video_output_path=str(video_output_path) if video_output_path else None,
         pid=os.getpid(),
     )
 
@@ -298,11 +370,22 @@ def run(output_path: Path, sample_rate: int, bit_depth: int, channels: int) -> i
     # currently reflected.
     current_state = _initial_state(supervisor_pid=os.getpid())
     current_state["output_path"] = str(output_path)
+    current_state["video_output_path"] = (
+        str(video_output_path) if video_output_path else None
+    )
     state.write_state(current_state)
 
     # Send the `start` command. We do this before reading any events because
     # the Swift binary's first event (`ready`) is emitted at startup; on the
     # next event after `ready` we expect `started` to follow our command.
+    #
+    # Video parameters are optional on the wire: when ``video_output_path`` is
+    # ``None`` the field is omitted entirely (see ``ipc.serialize_command``)
+    # and the binary skips video capture. Slice 1 wires the plumbing without
+    # yet rendering any frames.
+    video_config = (
+        ipc.VideoConfig(fps=30, show_cursor=True) if video_output_path else None
+    )
     _send_command(
         proc,
         ipc.StartCommand(
@@ -312,6 +395,10 @@ def run(output_path: Path, sample_rate: int, bit_depth: int, channels: int) -> i
                 bit_depth=bit_depth,
                 channels=channels,
             ),
+            video_output_path=(
+                str(video_output_path) if video_output_path else None
+            ),
+            video=video_config,
         ),
     )
 
@@ -429,6 +516,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Absolute path of the WAV file the binary will eventually write.",
     )
+    parser.add_argument(
+        "--video-output-path",
+        required=False,
+        default=None,
+        type=Path,
+        help=(
+            "Absolute path of the MP4 file the binary will eventually write. "
+            "When omitted, video capture is skipped entirely."
+        ),
+    )
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--bit-depth", type=int, default=16)
     parser.add_argument("--channels", type=int, default=1)
@@ -440,11 +537,15 @@ def main(argv: list[str] | None = None) -> int:
     output_path = args.output_path
     if not output_path.is_absolute():
         output_path = output_path.resolve()
+    video_output_path: Path | None = args.video_output_path
+    if video_output_path is not None and not video_output_path.is_absolute():
+        video_output_path = video_output_path.resolve()
     return run(
         output_path=output_path,
         sample_rate=args.sample_rate,
         bit_depth=args.bit_depth,
         channels=args.channels,
+        video_output_path=video_output_path,
     )
 
 

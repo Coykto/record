@@ -17,6 +17,19 @@ struct AudioFormat: Codable, Equatable {
     }
 }
 
+/// Video config payload carried inside a `start` command when video capture is requested.
+///
+/// JSON shape: `{"fps":30,"show_cursor":true}`
+struct VideoConfig: Codable, Equatable {
+    var fps: Int
+    var showsCursor: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case fps
+        case showsCursor = "show_cursor"
+    }
+}
+
 // MARK: - Commands (orchestrator → daemon)
 
 /// A command read off stdin from the orchestrator.
@@ -24,14 +37,16 @@ struct AudioFormat: Codable, Equatable {
 /// Discriminator is the `cmd` field. Unknown values throw a decoding error
 /// so that callers can surface a clean `error` event upstream.
 enum Command: Equatable {
-    case start(outputPath: String, format: AudioFormat)
+    case start(outputPath: String, videoOutputPath: String?, format: AudioFormat, video: VideoConfig?)
     case stop
     case shutdown
 
     private enum CodingKeys: String, CodingKey {
         case cmd
         case outputPath = "output_path"
+        case videoOutputPath = "video_output_path"
         case format
+        case video
     }
 
     private enum CommandKind: String, Decodable {
@@ -48,8 +63,12 @@ extension Command: Codable {
         switch kind {
         case .start:
             let path = try container.decode(String.self, forKey: .outputPath)
+            // Both video fields are optional: audio-only callers (and the
+            // existing Slice 1 fixtures/tests) omit them entirely.
+            let videoPath = try container.decodeIfPresent(String.self, forKey: .videoOutputPath)
             let fmt = try container.decode(AudioFormat.self, forKey: .format)
-            self = .start(outputPath: path, format: fmt)
+            let video = try container.decodeIfPresent(VideoConfig.self, forKey: .video)
+            self = .start(outputPath: path, videoOutputPath: videoPath, format: fmt, video: video)
         case .stop:
             self = .stop
         case .shutdown:
@@ -60,10 +79,12 @@ extension Command: Codable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case .start(let path, let fmt):
+        case .start(let path, let videoPath, let fmt, let video):
             try container.encode("start", forKey: .cmd)
             try container.encode(path, forKey: .outputPath)
+            try container.encodeIfPresent(videoPath, forKey: .videoOutputPath)
             try container.encode(fmt, forKey: .format)
+            try container.encodeIfPresent(video, forKey: .video)
         case .stop:
             try container.encode("stop", forKey: .cmd)
         case .shutdown:
@@ -86,6 +107,20 @@ enum SourceKind: String, Codable {
     case systemAudio = "system_audio"
 }
 
+/// Closed set of reasons for `display_reconfigured` events.
+enum DisplayReconfigurationReason: String, Codable {
+    case primaryChanged = "primary_changed"
+    case resolutionChanged = "resolution_changed"
+    case displayRemoved = "display_removed"
+}
+
+/// Closed set of reasons for `capture_ended_by_system_event` events.
+enum SystemEventReason: String, Codable {
+    case systemSleep = "system_sleep"
+    case displaySleep = "display_sleep"
+    case screenLocked = "screen_locked"
+}
+
 /// An event written as a single JSON line to stdout.
 ///
 /// Discriminator is the `event` field.
@@ -98,6 +133,11 @@ enum Event: Equatable {
     case sourceLost(source: SourceKind, atOffsetSeconds: Double, reason: String)
     case stopped(durationSeconds: Double, outputPath: String)
     case error(message: String)
+    case videoStarted(displayId: Int, widthPx: Int, heightPx: Int, fps: Int)
+    case videoLost(atOffsetSeconds: Double, reason: String, message: String)
+    case videoFile(path: String, durationSeconds: Double)
+    case displayReconfigured(reason: DisplayReconfigurationReason, newDisplayId: Int, newWidthPx: Int, newHeightPx: Int)
+    case captureEndedBySystemEvent(reason: SystemEventReason, atOffsetSeconds: Double)
 
     private enum CodingKeys: String, CodingKey {
         case event
@@ -109,6 +149,14 @@ enum Event: Equatable {
         case durationSeconds = "duration_seconds"
         case outputPath = "output_path"
         case message
+        case displayId = "display_id"
+        case widthPx = "width_px"
+        case heightPx = "height_px"
+        case fps
+        case path
+        case newDisplayId = "new_display_id"
+        case newWidthPx = "new_width_px"
+        case newHeightPx = "new_height_px"
     }
 
     private enum EventKind: String, Codable {
@@ -120,6 +168,11 @@ enum Event: Equatable {
         case sourceLost = "source_lost"
         case stopped
         case error
+        case videoStarted = "video_started"
+        case videoLost = "video_lost"
+        case videoFile = "video_file"
+        case displayReconfigured = "display_reconfigured"
+        case captureEndedBySystemEvent = "capture_ended_by_system_event"
     }
 }
 
@@ -154,6 +207,31 @@ extension Event: Codable {
         case .error:
             let m = try container.decode(String.self, forKey: .message)
             self = .error(message: m)
+        case .videoStarted:
+            let id = try container.decode(Int.self, forKey: .displayId)
+            let w = try container.decode(Int.self, forKey: .widthPx)
+            let h = try container.decode(Int.self, forKey: .heightPx)
+            let f = try container.decode(Int.self, forKey: .fps)
+            self = .videoStarted(displayId: id, widthPx: w, heightPx: h, fps: f)
+        case .videoLost:
+            let off = try container.decode(Double.self, forKey: .atOffsetSeconds)
+            let reason = try container.decode(String.self, forKey: .reason)
+            let m = try container.decode(String.self, forKey: .message)
+            self = .videoLost(atOffsetSeconds: off, reason: reason, message: m)
+        case .videoFile:
+            let p = try container.decode(String.self, forKey: .path)
+            let d = try container.decode(Double.self, forKey: .durationSeconds)
+            self = .videoFile(path: p, durationSeconds: d)
+        case .displayReconfigured:
+            let r = try container.decode(DisplayReconfigurationReason.self, forKey: .reason)
+            let id = try container.decode(Int.self, forKey: .newDisplayId)
+            let w = try container.decode(Int.self, forKey: .newWidthPx)
+            let h = try container.decode(Int.self, forKey: .newHeightPx)
+            self = .displayReconfigured(reason: r, newDisplayId: id, newWidthPx: w, newHeightPx: h)
+        case .captureEndedBySystemEvent:
+            let r = try container.decode(SystemEventReason.self, forKey: .reason)
+            let off = try container.decode(Double.self, forKey: .atOffsetSeconds)
+            self = .captureEndedBySystemEvent(reason: r, atOffsetSeconds: off)
         }
     }
 
@@ -186,6 +264,31 @@ extension Event: Codable {
         case .error(let message):
             try container.encode(EventKind.error, forKey: .event)
             try container.encode(message, forKey: .message)
+        case .videoStarted(let displayId, let widthPx, let heightPx, let fps):
+            try container.encode(EventKind.videoStarted, forKey: .event)
+            try container.encode(displayId, forKey: .displayId)
+            try container.encode(widthPx, forKey: .widthPx)
+            try container.encode(heightPx, forKey: .heightPx)
+            try container.encode(fps, forKey: .fps)
+        case .videoLost(let offset, let reason, let message):
+            try container.encode(EventKind.videoLost, forKey: .event)
+            try container.encode(offset, forKey: .atOffsetSeconds)
+            try container.encode(reason, forKey: .reason)
+            try container.encode(message, forKey: .message)
+        case .videoFile(let path, let duration):
+            try container.encode(EventKind.videoFile, forKey: .event)
+            try container.encode(path, forKey: .path)
+            try container.encode(duration, forKey: .durationSeconds)
+        case .displayReconfigured(let reason, let newDisplayId, let newWidthPx, let newHeightPx):
+            try container.encode(EventKind.displayReconfigured, forKey: .event)
+            try container.encode(reason, forKey: .reason)
+            try container.encode(newDisplayId, forKey: .newDisplayId)
+            try container.encode(newWidthPx, forKey: .newWidthPx)
+            try container.encode(newHeightPx, forKey: .newHeightPx)
+        case .captureEndedBySystemEvent(let reason, let offset):
+            try container.encode(EventKind.captureEndedBySystemEvent, forKey: .event)
+            try container.encode(reason, forKey: .reason)
+            try container.encode(offset, forKey: .atOffsetSeconds)
         }
     }
 }

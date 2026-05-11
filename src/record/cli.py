@@ -99,6 +99,24 @@ def _format_offset(seconds: float | None) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def _summarize_video(state_dict: dict[str, Any]) -> str:
+    """Build the human-friendly video-source line for the stop summary.
+
+    Returns one of:
+      - ``"video: never_attached"`` — no ``video_started`` event was observed
+        (e.g. audio-only run, or video failed before producing a single frame).
+      - ``"video: attached"`` — the video stream is currently/last-known
+        attached. Slice 2+ will refine this with the recorded mp4 path and
+        duration; slice 1 keeps it minimal.
+      - ``"video: lost"`` — the video stream errored out mid-capture; audio
+        was unaffected.
+    """
+    sources = state_dict.get("sources") or {}
+    video = sources.get("video") or {}
+    status = video.get("status", "never_attached")
+    return f"video: {status}"
+
+
 def _summarize_sources(state_dict: dict[str, Any]) -> str:
     """Build the human-friendly sources line for the stop summary."""
     sources = state_dict.get("sources") or {}
@@ -253,9 +271,13 @@ def start() -> None:
         )
         raise typer.Exit(code=3)
 
-    # Resolve the absolute output path before forking so the supervisor sees
-    # a fully qualified path even if its CWD differs from ours.
-    output_path = (Path.cwd() / f"{_filename_timestamp()}.wav").resolve()
+    # Resolve the absolute output paths before forking so the supervisor sees
+    # fully qualified paths even if its CWD differs from ours. Both the .wav
+    # and the .mp4 share a single timestamp stem — compute the stem once and
+    # reuse it so the pair is always co-named on disk.
+    stem = _filename_timestamp()
+    output_path = (Path.cwd() / f"{stem}.wav").resolve()
+    video_output_path = (Path.cwd() / f"{stem}.mp4").resolve()
 
     # Spawn the supervisor fully detached from this terminal. Format params
     # are passed explicitly so the CLI owns the capture-format decision; the
@@ -268,6 +290,8 @@ def start() -> None:
                 "record.supervisor",
                 "--output-path",
                 str(output_path),
+                "--video-output-path",
+                str(video_output_path),
                 "--sample-rate",
                 str(_SAMPLE_RATE),
                 "--bit-depth",
@@ -340,7 +364,10 @@ def start() -> None:
         )
         raise typer.Exit(code=3) from None
 
-    typer.echo(f"capture started (pid {proc.pid}) -> {output_path}")
+    typer.echo(
+        f"capture started (pid {proc.pid}) -> "
+        f"audio={output_path}, video={video_output_path}"
+    )
 
 
 @app.command()
@@ -403,13 +430,17 @@ def stop() -> None:
         raise typer.Exit(code=2)
 
     output_path = final.get("output_path") or "(unknown)"
+    video_output_path = final.get("video_output_path") or "(unknown)"
     duration = _format_duration(final.get("duration_seconds"))
     sources_line = _summarize_sources(final)
+    video_line = _summarize_video(final)
 
     typer.echo(f"capture stopped")
     typer.echo(f"  output:   {output_path}")
+    typer.echo(f"  video:    {video_output_path}")
     typer.echo(f"  duration: {duration}")
     typer.echo(f"  sources:  {sources_line}")
+    typer.echo(f"  {video_line}")
     for warning in _extra_warnings(final):
         typer.echo(f"  warning:  {warning}")
 

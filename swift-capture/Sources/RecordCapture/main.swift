@@ -103,10 +103,17 @@ sigtermSource.resume()
 
 // MARK: - Command handlers
 
-func handleStart(outputPath: String, format _: AudioFormat) {
+func handleStart(outputPath: String, videoOutputPath: String?, format _: AudioFormat) {
     if capture != nil {
         emit(.error(message: "start received while capture is already running"))
         return
+    }
+
+    if let path = videoOutputPath {
+        // Stdout is reserved for the JSON-line protocol; diagnostic lines must
+        // go to stderr so the supervisor's `daemon.log` captures them without
+        // corrupting the event stream.
+        FileHandle.standardError.write(Data("video output path requested: \(path)\n".utf8))
     }
 
     let url = URL(fileURLWithPath: outputPath)
@@ -192,8 +199,8 @@ let stdinThread = Thread {
         // RunLoop's executor.
         DispatchQueue.main.async {
             switch command {
-            case .start(let outputPath, let format):
-                handleStart(outputPath: outputPath, format: format)
+            case .start(let outputPath, let videoOutputPath, let format, _):
+                handleStart(outputPath: outputPath, videoOutputPath: videoOutputPath, format: format)
             case .stop:
                 handleStop()
             case .shutdown:

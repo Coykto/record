@@ -35,12 +35,37 @@ class AudioFormat(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class VideoConfig(BaseModel):
+    """Video-capture parameters carried in the `start` command.
+
+    Optional in the wire schema: when ``video_output_path`` / ``video`` are
+    omitted, the Swift binary skips video capture entirely. This keeps
+    audio-only callers (and audio-focused tests) backwards-compatible.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    fps: int = Field(..., description="Target capture frame rate, e.g. 30.")
+    show_cursor: bool = Field(..., description="Whether to render the cursor in the MP4.")
+
+
 class StartCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cmd: Literal["start"] = "start"
     output_path: str = Field(..., description="Absolute path of the WAV file to write.")
     format: AudioFormat
+    video_output_path: str | None = Field(
+        default=None,
+        description=(
+            "Absolute path of the MP4 file to write. When None (or omitted on "
+            "the wire), the binary skips video capture entirely."
+        ),
+    )
+    video: VideoConfig | None = Field(
+        default=None,
+        description="Video capture parameters; required iff video_output_path is set.",
+    )
 
 
 class StopCommand(BaseModel):
@@ -71,6 +96,8 @@ _command_adapter: TypeAdapter[Command] = TypeAdapter(Command)
 # Closed enums for event payloads.
 SourceName = Literal["mic", "system_audio"]
 PermissionKind = Literal["microphone", "screen_recording"]
+VideoReconfigReason = Literal["primary_changed", "resolution_changed", "display_removed"]
+SystemEventReason = Literal["system_sleep", "display_sleep", "screen_locked"]
 
 
 class ReadyEvent(BaseModel):
@@ -133,6 +160,69 @@ class ErrorEvent(BaseModel):
     message: str
 
 
+class VideoStartedEvent(BaseModel):
+    """Emitted once MP4Writer has accepted its first frame."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event: Literal["video_started"] = "video_started"
+    display_id: int
+    width_px: int
+    height_px: int
+    fps: int
+
+
+class VideoLostEvent(BaseModel):
+    """Emitted when the video SCStream errors out or is otherwise terminated.
+
+    ``reason`` is free-form (e.g. ``sc_stream_error``, ``permission_denied``,
+    ``writer_failure``). The audio capture is independent and is unaffected.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event: Literal["video_lost"] = "video_lost"
+    at_offset_seconds: float
+    reason: str
+    message: str | None = None
+
+
+class VideoFileEvent(BaseModel):
+    """Emitted after the MP4 writer's ``finishWriting`` completes successfully."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event: Literal["video_file"] = "video_file"
+    path: str
+    duration_seconds: float
+
+
+class DisplayReconfiguredEvent(BaseModel):
+    """Emitted on a primary-display change (mode switch, hotplug, etc.)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event: Literal["display_reconfigured"] = "display_reconfigured"
+    reason: VideoReconfigReason
+    new_display_id: int
+    new_width_px: int
+    new_height_px: int
+
+
+class CaptureEndedBySystemEventEvent(BaseModel):
+    """Emitted when system sleep / display sleep / screen lock ends capture.
+
+    The binary performs the same internal stop path as the ``stop`` command,
+    then emits this event immediately before the regular ``stopped`` event.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event: Literal["capture_ended_by_system_event"] = "capture_ended_by_system_event"
+    reason: SystemEventReason
+    at_offset_seconds: float
+
+
 Event = Annotated[
     Union[
         ReadyEvent,
@@ -143,6 +233,11 @@ Event = Annotated[
         SourceLostEvent,
         StoppedEvent,
         ErrorEvent,
+        VideoStartedEvent,
+        VideoLostEvent,
+        VideoFileEvent,
+        DisplayReconfiguredEvent,
+        CaptureEndedBySystemEventEvent,
     ],
     Field(discriminator="event"),
 ]
@@ -160,8 +255,14 @@ def serialize_command(cmd: Command) -> str:
 
     No trailing newline is appended — the caller is responsible for writing the
     framing newline (the protocol is JSON-lines).
+
+    ``exclude_none=True`` keeps the wire payload minimal: when ``StartCommand``
+    has no ``video_output_path`` / ``video`` set, those keys are omitted
+    entirely. The Swift side uses ``decodeIfPresent`` so omission is the
+    correct way to signal "audio only". None of the existing required fields
+    have ``None`` defaults, so this flag is a no-op for them.
     """
-    return _command_adapter.dump_json(cmd).decode("utf-8")
+    return _command_adapter.dump_json(cmd, exclude_none=True).decode("utf-8")
 
 
 def parse_command(line: str) -> Command:
@@ -189,6 +290,7 @@ def parse_event(line: str) -> Event:
 
 __all__ = [
     "AudioFormat",
+    "VideoConfig",
     "StartCommand",
     "StopCommand",
     "ShutdownCommand",
@@ -201,9 +303,16 @@ __all__ = [
     "SourceLostEvent",
     "StoppedEvent",
     "ErrorEvent",
+    "VideoStartedEvent",
+    "VideoLostEvent",
+    "VideoFileEvent",
+    "DisplayReconfiguredEvent",
+    "CaptureEndedBySystemEventEvent",
     "Event",
     "SourceName",
     "PermissionKind",
+    "VideoReconfigReason",
+    "SystemEventReason",
     "serialize_command",
     "parse_command",
     "serialize_event",
