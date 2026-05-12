@@ -40,11 +40,28 @@ final class ProtocolTests: XCTestCase {
     /// so we compare via the typed value, not the JSON bytes).
     private var commandFixtures: [(file: String, expected: Command)] {
         [
+            // Audio-only `start` fixture from 001. The video fields are
+            // optional on the wire and must round-trip as `nil` so older
+            // audio-only callers stay compatible.
             (
                 "start",
                 .start(
                     outputPath: "/abs/path/to/2026-05-10T14-32-08.wav",
-                    format: AudioFormat(sampleRate: 16000, bitDepth: 16, channels: 1)
+                    videoOutputPath: nil,
+                    format: AudioFormat(sampleRate: 16000, bitDepth: 16, channels: 1),
+                    video: nil
+                )
+            ),
+            // Extended `start` fixture from 002 (this spec). Both new fields
+            // are populated so a regression that drops them on decode/encode
+            // surfaces here.
+            (
+                "start_with_video",
+                .start(
+                    outputPath: "/abs/path/to/2026-05-10T14-32-08.wav",
+                    videoOutputPath: "/abs/path/to/2026-05-10T14-32-08.mp4",
+                    format: AudioFormat(sampleRate: 16000, bitDepth: 16, channels: 1),
+                    video: VideoConfig(fps: 30, showsCursor: true)
                 )
             ),
             ("stop", .stop),
@@ -108,7 +125,50 @@ final class ProtocolTests: XCTestCase {
                     outputPath: "/abs/path/to/2026-05-10T14-32-08.wav"
                 )
             ),
-            ("error", .error(message: "capture binary missing"))
+            ("error", .error(message: "capture binary missing")),
+            // Spec 002 events. Field values mirror the JSON examples in
+            // `technical-considerations.md` §2.6 so the fixtures are
+            // recognizably the same shapes documented there.
+            (
+                "video_started",
+                .videoStarted(
+                    displayId: 1,
+                    widthPx: 2560,
+                    heightPx: 1440,
+                    fps: 30
+                )
+            ),
+            (
+                "video_lost",
+                .videoLost(
+                    atOffsetSeconds: 134.2,
+                    reason: "sc_stream_error",
+                    message: "stream stopped: -16665"
+                )
+            ),
+            (
+                "video_file",
+                .videoFile(
+                    path: "/abs/path/to/2026-05-10T14-32-08.mp4",
+                    durationSeconds: 612.4
+                )
+            ),
+            (
+                "display_reconfigured",
+                .displayReconfigured(
+                    reason: .primaryChanged,
+                    newDisplayId: 2,
+                    newWidthPx: 1920,
+                    newHeightPx: 1080
+                )
+            ),
+            (
+                "capture_ended_by_system_event",
+                .captureEndedBySystemEvent(
+                    reason: .systemSleep,
+                    atOffsetSeconds: 134.2
+                )
+            )
         ]
     }
 

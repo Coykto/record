@@ -105,15 +105,54 @@ def _summarize_video(state_dict: dict[str, Any]) -> str:
     Returns one of:
       - ``"video: never_attached"`` — no ``video_started`` event was observed
         (e.g. audio-only run, or video failed before producing a single frame).
-      - ``"video: attached"`` — the video stream is currently/last-known
-        attached. Slice 2+ will refine this with the recorded mp4 path and
-        duration; slice 1 keeps it minimal.
-      - ``"video: lost"`` — the video stream errored out mid-capture; audio
-        was unaffected.
+      - ``"video: <path> (<duration>, <width>×<height>)"`` — the video stream
+        attached and produced an mp4. The duration comes from the ``video_file``
+        event (preferred) and falls back to the audio duration / ``unknown`` if
+        the event hasn't landed (defensive — a clean stop always emits one).
+      - ``"video: unavailable — <reason>"`` — the video stream never produced a
+        frame (``at_offset_seconds == 0``); typically permission denial. No mp4
+        on disk.
+      - ``"video: <path> — stopped at MM:SS, reason <reason>"`` — the video
+        stream errored out mid-capture; audio was unaffected and the partial
+        mp4 is playable up to the failure point.
     """
     sources = state_dict.get("sources") or {}
     video = sources.get("video") or {}
     status = video.get("status", "never_attached")
+
+    if status == "attached":
+        path = state_dict.get("video_output_path") or "(unknown)"
+        # Prefer the binary's reported video duration; fall back to the audio
+        # capture duration if the video_file event hasn't been processed.
+        duration_seconds = state_dict.get("video_file_duration_seconds")
+        if duration_seconds is None:
+            duration_seconds = state_dict.get("duration_seconds")
+        duration = _format_duration(duration_seconds)
+        width = video.get("width_px")
+        height = video.get("height_px")
+        dims = f"{width}×{height}" if width and height else "unknown"
+        return f"video: {path} ({duration}, {dims})"
+
+    if status == "lost":
+        # Find the single video warning (supervisor idempotency guarantees at
+        # most one). Read offset + reason; discriminate offset-0 (never started)
+        # from a mid-capture failure.
+        video_warning: dict[str, Any] | None = None
+        for w in state_dict.get("warnings", []) or []:
+            if isinstance(w, dict) and w.get("source") == "video":
+                video_warning = w
+                break
+        if video_warning is None:
+            # Defensive fallback — shouldn't happen in practice.
+            path = state_dict.get("video_output_path") or "(unknown)"
+            return f"video: {path} (lost)"
+        reason = video_warning.get("message") or "unknown"
+        offset = video_warning.get("at_offset_seconds")
+        if offset == 0:
+            return f"video: unavailable — {reason}"
+        path = state_dict.get("video_output_path") or "(unknown)"
+        return f"video: {path} — stopped at {_format_offset(offset)}, reason {reason}"
+
     return f"video: {status}"
 
 
@@ -160,8 +199,8 @@ def _extra_warnings(state_dict: dict[str, Any]) -> list[str]:
     # Note: permission_denied is handled separately by the exit-2 branch in
     # `stop`; intentionally not included here.
     for w in state_dict.get("warnings", []) or []:
-        if w.get("source") in ("mic", "system_audio"):
-            continue  # already covered by the sources line
+        if w.get("source") in ("mic", "system_audio", "video"):
+            continue  # already covered by the sources / video line
         msg = w.get("message")
         if msg:
             extras.append(str(msg))
@@ -430,14 +469,12 @@ def stop() -> None:
         raise typer.Exit(code=2)
 
     output_path = final.get("output_path") or "(unknown)"
-    video_output_path = final.get("video_output_path") or "(unknown)"
     duration = _format_duration(final.get("duration_seconds"))
     sources_line = _summarize_sources(final)
     video_line = _summarize_video(final)
 
     typer.echo(f"capture stopped")
     typer.echo(f"  output:   {output_path}")
-    typer.echo(f"  video:    {video_output_path}")
     typer.echo(f"  duration: {duration}")
     typer.echo(f"  sources:  {sources_line}")
     typer.echo(f"  {video_line}")

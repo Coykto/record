@@ -221,6 +221,334 @@ def test_stop_prints_summary_when_state_present(
     assert not fake_paths["state"].exists()
 
 
+# ---------------------------------------------------------------------------
+# `_summarize_video` unit coverage
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_video_never_attached() -> None:
+    """Default state (no video source seen) keeps the slice-1 minimal form."""
+    state_dict: dict[str, Any] = {
+        "sources": {"video": {"status": "never_attached"}},
+    }
+    assert cli._summarize_video(state_dict) == "video: never_attached"
+
+
+def test_summarize_video_attached_renders_path_duration_dimensions() -> None:
+    """Slice-2 happy path: `video: <path> (<duration>, <w>×<h>)` using `×`."""
+    state_dict: dict[str, Any] = {
+        "video_output_path": "/abs/2026-05-11T12-00-00.mp4",
+        "video_file_duration_seconds": 12.3,
+        "sources": {
+            "video": {
+                "status": "attached",
+                "width_px": 2560,
+                "height_px": 1440,
+            },
+        },
+    }
+    assert cli._summarize_video(state_dict) == (
+        "video: /abs/2026-05-11T12-00-00.mp4 (12.3 s, 2560×1440)"
+    )
+
+
+def test_summarize_video_attached_minute_plus_duration_uses_mss_format() -> None:
+    """Long captures switch to ``Mm SSs`` like the audio summary."""
+    state_dict: dict[str, Any] = {
+        "video_output_path": "/abs/long.mp4",
+        "video_file_duration_seconds": 125.0,
+        "sources": {
+            "video": {
+                "status": "attached",
+                "width_px": 1920,
+                "height_px": 1080,
+            },
+        },
+    }
+    assert cli._summarize_video(state_dict) == (
+        "video: /abs/long.mp4 (2m 05s, 1920×1080)"
+    )
+
+
+def test_summarize_video_attached_falls_back_to_audio_duration() -> None:
+    """Defensive: if `video_file_duration_seconds` is absent but the audio
+    capture has a duration, surface that rather than ``unknown``."""
+    state_dict: dict[str, Any] = {
+        "video_output_path": "/abs/x.mp4",
+        "duration_seconds": 7.4,
+        "sources": {
+            "video": {
+                "status": "attached",
+                "width_px": 1280,
+                "height_px": 720,
+            },
+        },
+    }
+    assert cli._summarize_video(state_dict) == (
+        "video: /abs/x.mp4 (7.4 s, 1280×720)"
+    )
+
+
+def test_summarize_video_attached_missing_duration_renders_unknown() -> None:
+    """If both `video_file_duration_seconds` and `duration_seconds` are absent
+    (the `video_file` and `stopped` events never arrived), render `unknown`."""
+    state_dict: dict[str, Any] = {
+        "video_output_path": "/abs/x.mp4",
+        "sources": {
+            "video": {
+                "status": "attached",
+                "width_px": 800,
+                "height_px": 600,
+            },
+        },
+    }
+    assert cli._summarize_video(state_dict) == (
+        "video: /abs/x.mp4 (unknown, 800×600)"
+    )
+
+
+def test_summarize_video_lost_defensive_fallback_no_warning() -> None:
+    """Defensive: ``status=lost`` without the accompanying video warning falls
+    back to the slice-2 ``(lost)`` shape rather than crashing."""
+    state_dict: dict[str, Any] = {
+        "video_output_path": "/abs/x.mp4",
+        "sources": {"video": {"status": "lost"}},
+        "warnings": [],
+    }
+    assert cli._summarize_video(state_dict) == "video: /abs/x.mp4 (lost)"
+
+
+def test_summarize_video_lost_offset_zero_renders_unavailable() -> None:
+    """Slice 5: offset 0 (video never started — typically permission denied)
+    renders ``"video: unavailable — <reason>"`` with no path."""
+    state_dict: dict[str, Any] = {
+        "video_output_path": None,
+        "sources": {"video": {"status": "lost"}},
+        "warnings": [
+            {
+                "source": "video",
+                "at_offset_seconds": 0,
+                "message": "permission_denied",
+            }
+        ],
+    }
+    assert cli._summarize_video(state_dict) == (
+        "video: unavailable — permission_denied"
+    )
+
+
+def test_summarize_video_lost_mid_capture_renders_path_and_offset() -> None:
+    """Slice 5: mid-capture loss surfaces the partial mp4 path, the MM:SS offset
+    where it stopped, and the reason."""
+    state_dict: dict[str, Any] = {
+        "video_output_path": "/abs/path.mp4",
+        "sources": {"video": {"status": "lost"}},
+        "warnings": [
+            {
+                "source": "video",
+                "at_offset_seconds": 134.0,
+                "message": "sc_stream_error",
+            }
+        ],
+    }
+    assert cli._summarize_video(state_dict) == (
+        "video: /abs/path.mp4 — stopped at 02:14, reason sc_stream_error"
+    )
+
+
+def test_summary_video_warning_not_duplicated_as_generic_warning() -> None:
+    """Slice 5: the video warning must not also appear as a generic
+    ``warning:`` line; it's reflected on the ``video:`` line already."""
+    state_dict: dict[str, Any] = {
+        "sources": {"video": {"status": "lost"}},
+        "warnings": [
+            {
+                "source": "video",
+                "at_offset_seconds": 0,
+                "message": "permission_denied",
+            }
+        ],
+    }
+    assert cli._extra_warnings(state_dict) == []
+
+
+# ---------------------------------------------------------------------------
+# `record stop` end-to-end summary against scripted state files
+#
+# The `_summarize_video` unit tests above pin the per-status string formats;
+# these tests drive the full `record stop` CLI codepath against a pre-seeded
+# state file (the equivalent of the supervisor having processed the matching
+# event sequence) and assert the full summary block. The state files mirror
+# what `supervisor._apply_event` would write after the corresponding event
+# stream:
+#
+#   attached       : video_started → video_file
+#   lost-offset-0  : video_lost(at_offset_seconds=0, reason="permission_denied")
+#   lost-mid-cap   : video_lost(at_offset_seconds=N>0, reason="...")
+#   never_attached : neither event observed (video skipped or pre-frame error)
+# ---------------------------------------------------------------------------
+
+
+def _install_stop_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Common stubs so the polling loop in `record stop` terminates immediately.
+
+    Matches the pattern from ``test_stop_prints_summary_when_state_present``:
+    stub ``os.kill`` to no-op and flip ``is_alive`` to ``False`` after the
+    first probe so the loop exits on the next iteration.
+    """
+    calls: dict[str, int] = {"is_alive": 0}
+
+    def _fake_is_alive(pid: int) -> bool:  # noqa: ARG001
+        calls["is_alive"] += 1
+        return calls["is_alive"] == 1
+
+    monkeypatch.setattr(state, "is_alive", _fake_is_alive)
+    monkeypatch.setattr(cli.state, "is_alive", _fake_is_alive)
+    monkeypatch.setattr(cli.os, "kill", lambda *a, **k: None)
+
+
+def _seed_stop_state(fake_paths: dict[str, Path], payload: dict[str, Any]) -> None:
+    import json as _json
+
+    fake_paths["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
+    fake_paths["state"].write_text(_json.dumps(payload), encoding="utf-8")
+
+
+def test_stop_summary_video_attached_renders_path_and_dimensions(
+    fake_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Slice 2 happy path under the full `record stop` flow: the summary block
+    includes ``video: <path> (<duration>, <w>×<h>)`` on its own line."""
+    _seed_stop_state(
+        fake_paths,
+        {
+            "output_path": "/abs/2026-05-11T12-00-00.wav",
+            "video_output_path": "/abs/2026-05-11T12-00-00.mp4",
+            "duration_seconds": 12.3,
+            "video_file_duration_seconds": 12.3,
+            "sources": {
+                "mic": {"status": "attached"},
+                "system_audio": {"status": "attached"},
+                "video": {
+                    "status": "attached",
+                    "width_px": 2560,
+                    "height_px": 1440,
+                },
+            },
+            "warnings": [],
+            "final": True,
+        },
+    )
+    _install_stop_stubs(monkeypatch)
+
+    result = runner.invoke(cli.app, ["stop"])
+    assert result.exit_code == 0, result.stderr
+    assert "capture stopped" in result.stdout
+    assert (
+        "video: /abs/2026-05-11T12-00-00.mp4 (12.3 s, 2560×1440)"
+        in result.stdout
+    )
+
+
+def test_stop_summary_video_lost_offset_zero_renders_unavailable(
+    fake_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Slice 5 case 1: permission denied / pre-first-frame failure renders
+    ``video: unavailable — <reason>`` with no path."""
+    _seed_stop_state(
+        fake_paths,
+        {
+            "output_path": "/abs/2026-05-11T12-00-00.wav",
+            # Supervisor clears the path on offset-0 loss; mirror that here.
+            "video_output_path": None,
+            "duration_seconds": 9.5,
+            "sources": {
+                "mic": {"status": "attached"},
+                "system_audio": {"status": "attached"},
+                "video": {"status": "lost"},
+            },
+            "warnings": [
+                {
+                    "source": "video",
+                    "at_offset_seconds": 0,
+                    "message": "permission_denied",
+                }
+            ],
+            "final": True,
+        },
+    )
+    _install_stop_stubs(monkeypatch)
+
+    result = runner.invoke(cli.app, ["stop"])
+    assert result.exit_code == 0, result.stderr
+    assert "video: unavailable — permission_denied" in result.stdout
+    # No phantom path on disk in the rendered summary block.
+    assert ".mp4" not in result.stdout
+
+
+def test_stop_summary_video_lost_mid_capture_renders_path_and_offset(
+    fake_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Slice 5 case 2: mid-capture loss renders the partial mp4 path plus the
+    MM:SS offset and the failure reason on one line."""
+    _seed_stop_state(
+        fake_paths,
+        {
+            "output_path": "/abs/2026-05-11T12-00-00.wav",
+            "video_output_path": "/abs/2026-05-11T12-00-00.mp4",
+            "duration_seconds": 200.0,
+            "sources": {
+                "mic": {"status": "attached"},
+                "system_audio": {"status": "attached"},
+                "video": {"status": "lost"},
+            },
+            "warnings": [
+                {
+                    "source": "video",
+                    "at_offset_seconds": 134.0,
+                    "message": "sc_stream_error",
+                }
+            ],
+            "final": True,
+        },
+    )
+    _install_stop_stubs(monkeypatch)
+
+    result = runner.invoke(cli.app, ["stop"])
+    assert result.exit_code == 0, result.stderr
+    assert (
+        "video: /abs/2026-05-11T12-00-00.mp4 — stopped at 02:14, reason sc_stream_error"
+        in result.stdout
+    )
+
+
+def test_stop_summary_video_never_attached_renders_status(
+    fake_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Slice 1 baseline: audio-only run (or pre-frame video skip) renders
+    ``video: never_attached``. No file path on the line — there's no mp4."""
+    _seed_stop_state(
+        fake_paths,
+        {
+            "output_path": "/abs/2026-05-11T12-00-00.wav",
+            "video_output_path": "/abs/2026-05-11T12-00-00.mp4",
+            "duration_seconds": 3.0,
+            "sources": {
+                "mic": {"status": "attached"},
+                "system_audio": {"status": "attached"},
+                "video": {"status": "never_attached"},
+            },
+            "warnings": [],
+            "final": True,
+        },
+    )
+    _install_stop_stubs(monkeypatch)
+
+    result = runner.invoke(cli.app, ["stop"])
+    assert result.exit_code == 0, result.stderr
+    assert "video: never_attached" in result.stdout
+
+
 def test_stop_exits_2_on_permission_denied(
     fake_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

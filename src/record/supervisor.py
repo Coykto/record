@@ -247,6 +247,13 @@ def _apply_event(current: dict[str, Any], event: ipc.Event) -> dict[str, Any]:
                 "at_offset_seconds": event.at_offset_seconds,
             }
         )
+        # Offset 0 means video never produced a frame (typically permission
+        # denial), so no `.mp4` exists on disk. Clear the configured path so the
+        # stop summary won't dangle a phantom file name. Mid-capture losses
+        # (offset > 0) keep the path: the partial mp4 was finalized by the
+        # binary and is playable up to the failure point.
+        if event.at_offset_seconds == 0:
+            current["video_output_path"] = None
         return current
 
     if isinstance(event, ipc.VideoFileEvent):
@@ -488,6 +495,40 @@ def run(
                 ),
             }
         )
+
+    # System-event-triggered clean exit: the binary emitted `stopped` on its
+    # own (saw_stopped=True) without us asking (stop_requested is the SIGTERM
+    # flag — a user `record stop` always sets it before the binary stops, so
+    # `not stop_requested.is_set()` is the only reliable way to discriminate
+    # a system-event shutdown from a user-initiated one here), and the binary
+    # already told us which system reason ended the capture via the
+    # `capture_ended_by_system_event` event (see _apply_event).
+    _system_event_reasons = {"system_sleep", "display_sleep", "screen_locked"}
+    ended_by = current_state.get("ended_by")
+    if (
+        saw_stopped
+        and not stop_requested.is_set()
+        and ended_by in _system_event_reasons
+    ):
+        parts = [
+            f"[{_utcnow_iso()}]",
+            "capture ended by system event",
+            f"reason={ended_by}",
+            f"audio={current_state.get('output_path')}",
+        ]
+        video_path = current_state.get("video_output_path")
+        if video_path:
+            parts.append(f"video={video_path}")
+        duration = current_state.get("duration_seconds")
+        if duration is not None:
+            parts.append(f"duration_seconds={duration}")
+        summary_line = " ".join(parts) + "\n"
+        try:
+            resolved.orchestrator_log.parent.mkdir(parents=True, exist_ok=True)
+            with open(resolved.orchestrator_log, "a", encoding="utf-8") as fp:
+                fp.write(summary_line)
+        except OSError as exc:
+            _log.warning("orchestrator_summary_write_failed", error=str(exc))
 
     current_state["final"] = True
     current_state["last_event_at"] = _utcnow_iso()

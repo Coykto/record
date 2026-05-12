@@ -4,10 +4,19 @@ Every Command and Event variant has a canonical JSON-line fixture under
 ``swift-capture/Tests/RecordCaptureTests/Fixtures/``. The Swift test suite
 loads the same files, so any byte-level drift here will also break Swift —
 that's the point.
+
+Round-trip equality is asserted at the JSON-object level (``json.loads(...) ==
+json.loads(...)``) rather than byte-for-byte: object key order is not
+semantically significant in JSON and the Swift fixtures occasionally order
+fields differently from the pydantic model's declaration order (e.g.
+``start_with_video.json`` puts ``video_output_path`` before ``format``). The
+parse + re-serialize step still guarantees we accept every field on the wire
+and emit no extras.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -15,6 +24,8 @@ from pydantic import ValidationError
 
 from record.ipc import (
     AudioFormat,
+    CaptureEndedBySystemEventEvent,
+    DisplayReconfiguredEvent,
     ErrorEvent,
     PermissionDeniedEvent,
     PermissionRequiredEvent,
@@ -26,6 +37,10 @@ from record.ipc import (
     StartedEvent,
     StopCommand,
     StoppedEvent,
+    VideoConfig,
+    VideoFileEvent,
+    VideoLostEvent,
+    VideoStartedEvent,
     parse_command,
     parse_event,
     serialize_command,
@@ -42,6 +57,7 @@ from .conftest import FIXTURES_DIR
 
 COMMAND_FIXTURES: list[tuple[str, type]] = [
     ("start.json", StartCommand),
+    ("start_with_video.json", StartCommand),
     ("stop.json", StopCommand),
     ("shutdown.json", ShutdownCommand),
 ]
@@ -59,6 +75,11 @@ EVENT_FIXTURES: list[tuple[str, type]] = [
     ("source_lost_system_audio.json", SourceLostEvent),
     ("stopped.json", StoppedEvent),
     ("error.json", ErrorEvent),
+    ("video_started.json", VideoStartedEvent),
+    ("video_lost.json", VideoLostEvent),
+    ("video_file.json", VideoFileEvent),
+    ("display_reconfigured.json", DisplayReconfiguredEvent),
+    ("capture_ended_by_system_event.json", CaptureEndedBySystemEventEvent),
 ]
 
 
@@ -72,7 +93,10 @@ def test_command_fixture_round_trip(filename: str, model_cls: type) -> None:
     line = _read_fixture("commands", filename)
     parsed = parse_command(line)
     assert isinstance(parsed, model_cls)
-    assert serialize_command(parsed).strip() == line.strip()
+    # Semantic round-trip: re-serialize the parsed model and compare the JSON
+    # object content (not byte order). See the module docstring for why we
+    # don't pin field declaration order across the Swift/Python boundary.
+    assert json.loads(serialize_command(parsed)) == json.loads(line)
 
 
 @pytest.mark.parametrize("filename,model_cls", EVENT_FIXTURES, ids=[f[0] for f in EVENT_FIXTURES])
@@ -80,7 +104,7 @@ def test_event_fixture_round_trip(filename: str, model_cls: type) -> None:
     line = _read_fixture("events", filename)
     parsed = parse_event(line)
     assert isinstance(parsed, model_cls)
-    assert serialize_event(parsed).strip() == line.strip()
+    assert json.loads(serialize_event(parsed)) == json.loads(line)
 
 
 # ---------------------------------------------------------------------------
@@ -99,9 +123,102 @@ def test_start_command_object_round_trip() -> None:
     assert parsed == cmd
 
 
+def test_start_command_with_video_object_round_trip() -> None:
+    """``StartCommand`` with both video fields populated round-trips end-to-end."""
+    cmd = StartCommand(
+        output_path="/abs/path/to/2026-05-10T14-32-08.wav",
+        format=AudioFormat(sample_rate=16000, bit_depth=16, channels=1),
+        video_output_path="/abs/path/to/2026-05-10T14-32-08.mp4",
+        video=VideoConfig(fps=30, show_cursor=True),
+    )
+    line = serialize_command(cmd)
+    parsed = parse_command(line)
+    assert parsed == cmd
+    # Bonus: serializer omits video keys when they're None (audio-only run).
+    audio_only = StartCommand(
+        output_path="/abs/x.wav",
+        format=AudioFormat(sample_rate=16000, bit_depth=16, channels=1),
+    )
+    audio_only_line = serialize_command(audio_only)
+    assert "video_output_path" not in audio_only_line
+    assert '"video"' not in audio_only_line
+
+
 def test_source_lost_event_object_round_trip() -> None:
     evt = SourceLostEvent(
         source="mic", at_offset_seconds=134.2, reason="input device disconnected"
+    )
+    line = serialize_event(evt)
+    parsed = parse_event(line)
+    assert parsed == evt
+
+
+def test_video_started_event_object_round_trip() -> None:
+    evt = VideoStartedEvent(display_id=1, width_px=2560, height_px=1440, fps=30)
+    line = serialize_event(evt)
+    parsed = parse_event(line)
+    assert parsed == evt
+
+
+def test_video_lost_event_object_round_trip_with_message() -> None:
+    evt = VideoLostEvent(
+        at_offset_seconds=134.2,
+        reason="sc_stream_error",
+        message="stream stopped: -16665",
+    )
+    line = serialize_event(evt)
+    parsed = parse_event(line)
+    assert parsed == evt
+
+
+def test_video_lost_event_message_is_optional_in_python_model() -> None:
+    """``message`` defaults to ``None`` on the Python side.
+
+    Python only ever parses ``video_lost`` (the supervisor never emits it), so
+    a permissive optional on the Python side is safe. The Swift side requires
+    the field to be present on the wire — `message` is non-optional in
+    ``Protocol.swift`` — so the canonical fixture always carries one. We just
+    assert the Python model accepts the parameter being omitted at construction
+    time, which is what the supervisor's own ``_apply_event`` would do.
+    """
+    evt = VideoLostEvent(at_offset_seconds=0.0, reason="permission_denied")
+    assert evt.message is None
+    line = serialize_event(evt)
+    parsed = parse_event(line)
+    assert parsed == evt
+
+
+def test_video_file_event_object_round_trip() -> None:
+    evt = VideoFileEvent(
+        path="/abs/path/to/2026-05-10T14-32-08.mp4", duration_seconds=612.4
+    )
+    line = serialize_event(evt)
+    parsed = parse_event(line)
+    assert parsed == evt
+
+
+@pytest.mark.parametrize(
+    "reason", ["primary_changed", "resolution_changed", "display_removed"]
+)
+def test_display_reconfigured_event_accepts_each_reason(reason: str) -> None:
+    evt = DisplayReconfiguredEvent(
+        reason=reason,  # type: ignore[arg-type]
+        new_display_id=2,
+        new_width_px=1920,
+        new_height_px=1080,
+    )
+    line = serialize_event(evt)
+    parsed = parse_event(line)
+    assert parsed == evt
+
+
+@pytest.mark.parametrize(
+    "reason", ["system_sleep", "display_sleep", "screen_locked"]
+)
+def test_capture_ended_by_system_event_accepts_each_reason(reason: str) -> None:
+    evt = CaptureEndedBySystemEventEvent(
+        reason=reason,  # type: ignore[arg-type]
+        at_offset_seconds=134.2,
     )
     line = serialize_event(evt)
     parsed = parse_event(line)
@@ -135,6 +252,12 @@ MALFORMED_EVENT_INPUTS: list[str] = [
     '{"event":"nope"}',  # unknown discriminator
     '{"event":"ready","extra":"field"}',  # extra fields forbidden
     '{"event":"source_attached","source":"speakers"}',  # bad enum
+    # New video / system events: bad enums must be rejected.
+    '{"event":"display_reconfigured","reason":"nope","new_display_id":1,"new_width_px":1,"new_height_px":1}',
+    '{"event":"capture_ended_by_system_event","reason":"reboot","at_offset_seconds":1.0}',
+    # Required fields cannot be elided.
+    '{"event":"video_started","display_id":1,"width_px":640,"height_px":360}',  # missing fps
+    '{"event":"video_file","path":"/x.mp4"}',  # missing duration_seconds
 ]
 
 
