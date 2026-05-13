@@ -15,10 +15,22 @@ from pathlib import Path
 _APP_SUPPORT_SUBPATH = ("Library", "Application Support", "record")
 _LOGS_SUBPATH = ("Library", "Logs", "record")
 
+# Slice-1 daemon log layout (spec 003 §2.10). Hard-coded for now; slice 3
+# replaces this with a config-driven resolver that consults the `log_folder`
+# key from ~/.config/record/config.toml. Kept as a tuple so the override is a
+# one-line edit when that lands.
+_DAEMON_LOG_ROOT = ("record", "logs")
+
 _PID_FILENAME = "capture.pid"
 _STATE_FILENAME = "capture-state.json"
 _DAEMON_LOG_FILENAME = "daemon.log"
 _ORCHESTRATOR_LOG_FILENAME = "orchestrator.log"
+
+# Daemon-side filenames (spec 003 §2.10). The daemon's PID file is a sibling
+# of `capture.pid` under Application Support; the control socket (path-only in
+# slice 1, wired in slice 2) lives next to it.
+_DAEMON_PID_FILENAME = "daemon.pid"
+_DAEMON_SOCKET_FILENAME = "daemon.sock"
 
 
 @dataclass(frozen=True)
@@ -63,6 +75,57 @@ def orchestrator_log() -> Path:
     return logs_dir() / _ORCHESTRATOR_LOG_FILENAME
 
 
+def daemon_pid_file() -> Path:
+    """Return the absolute path to the daemon's PID file.
+
+    Sibling of :func:`pid_file` under ``~/Library/Application Support/record/``.
+    The daemon (spec 003) claims this atomically at startup; the legacy
+    supervisor's :func:`pid_file` is unrelated and remains the singleton for
+    the foreground ``python -m record.supervisor`` test path.
+    """
+    return app_support_dir() / _DAEMON_PID_FILENAME
+
+
+def daemon_socket() -> Path:
+    """Return the absolute path to the daemon's Unix-domain control socket.
+
+    Path-only in slice 1 of spec 003 — slice 2 binds the socket. Lives next to
+    :func:`daemon_pid_file` under Application Support because it's machine-local
+    state, not user content.
+    """
+    return app_support_dir() / _DAEMON_SOCKET_FILENAME
+
+
+def daemon_log_dir() -> Path:
+    """Return ``~/record/logs/`` as an absolute Path.
+
+    Hard-coded for slice 1 (spec 003 tasks §1). Slice 3 will replace this with
+    a config-driven resolver that consults the ``log_folder`` key from
+    ``~/.config/record/config.toml``. Distinct from :func:`logs_dir` — that
+    one is the legacy ``~/Library/Logs/record/`` used by the supervisor.
+    """
+    return Path.home().joinpath(*_DAEMON_LOG_ROOT)
+
+
+def daemon_log_file() -> Path:
+    """Return the absolute path to the daemon's structured log file.
+
+    ``~/record/logs/daemon.log`` per FR 2.14. Hard-coded in slice 1; see
+    :func:`daemon_log_dir` for the reload story.
+    """
+    return daemon_log_dir() / _DAEMON_LOG_FILENAME
+
+
+def ensure_daemon_dirs() -> None:
+    """Create :func:`daemon_log_dir` and the daemon PID file's parent.
+
+    Both are idempotent (``parents=True, exist_ok=True``). Called by the
+    daemon at startup before any handler / PID-file claim runs.
+    """
+    daemon_log_dir().mkdir(parents=True, exist_ok=True)
+    app_support_dir().mkdir(parents=True, exist_ok=True)
+
+
 def resolve_paths() -> RecordPaths:
     """Resolve every path in one go and return them as a frozen dataclass."""
     return RecordPaths(
@@ -95,6 +158,11 @@ __all__ = [
     "state_file",
     "daemon_log",
     "orchestrator_log",
+    "daemon_pid_file",
+    "daemon_socket",
+    "daemon_log_dir",
+    "daemon_log_file",
+    "ensure_daemon_dirs",
     "resolve_paths",
     "ensure_dirs",
 ]

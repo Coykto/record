@@ -25,6 +25,13 @@ from . import paths, state
 
 app = typer.Typer(help="record: privacy-first meeting recorder")
 
+# `record daemon ...` sub-app — spec 003 slice 1. The daemon is a long-running
+# background process owning the hotkey/capture lifecycle in later slices; in
+# slice 1 it merely claims a PID file, idles on an asyncio.Event, and exits on
+# SIGTERM. The legacy `record start` / `record stop` commands are untouched.
+daemon_app = typer.Typer(help="Control the background record daemon.")
+app.add_typer(daemon_app, name="daemon")
+
 # How long `record stop` waits for the supervisor to exit after SIGTERM.
 _STOP_TIMEOUT_SECONDS = 10.0
 _STOP_POLL_INTERVAL = 0.1
@@ -34,6 +41,11 @@ _STOP_POLL_INTERVAL = 0.1
 # surface the right exit code instead of returning 0 and leaving a stale PID.
 _START_HANDSHAKE_SECONDS = 3.0
 _START_HANDSHAKE_INTERVAL = 0.1
+
+# Same idea for the daemon scaffold spawned by `record daemon start`. Kept as
+# distinct constants so tuning one doesn't move the supervisor's window.
+_DAEMON_START_HANDSHAKE_SECONDS = 3.0
+_DAEMON_START_POLL_INTERVAL = 0.05
 
 # Audio capture format. The Swift binary writes a WAV at exactly these
 # parameters; downstream transcription (Deepgram nova-3) is tuned for
@@ -484,3 +496,148 @@ def stop() -> None:
     # Tidy up. Both removals are idempotent on missing files.
     state.remove_pid_file()
     state.remove_state()
+
+
+# ---------------------------------------------------------------------------
+# `record daemon ...` — spec 003 slice 1
+# ---------------------------------------------------------------------------
+
+
+def _daemon_start_impl() -> int:
+    """Spawn the daemon detached; wait briefly for the PID file to appear.
+
+    Returns the would-be CLI exit code. ``record daemon start`` raises
+    :class:`typer.Exit` on a non-zero return; ``record daemon restart`` calls
+    this directly so it can chain without re-entering Typer.
+    """
+    daemon_pid_path = paths.daemon_pid_file()
+
+    # Already-running check (FR 2.3 first bullet). Mirrors the supervisor
+    # singleton logic in `start()` above but against the daemon PID file.
+    existing_pid = state.read_pid_file(path=daemon_pid_path)
+    if existing_pid is not None:
+        if state.is_alive(existing_pid):
+            typer.echo(f"daemon already running (PID {existing_pid})")
+            return 0
+        # Stale PID file from a crashed daemon — clear it so the spawn below
+        # can claim a fresh one.
+        state.remove_pid_file(path=daemon_pid_path)
+
+    # Spawn detached, same Popen pattern the supervisor uses. The daemon
+    # itself materialises its log directory on startup; we do not need to
+    # pre-create it here.
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "record.daemon"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except (OSError, FileNotFoundError) as exc:
+        typer.echo(f"failed to launch daemon: {exc}", err=True)
+        return 3
+
+    # Handshake: poll up to _DAEMON_START_HANDSHAKE_SECONDS for the PID file
+    # to appear (success) or the process to exit (failure). The daemon writes
+    # its PID file before it begins idling on the shutdown event.
+    deadline = time.monotonic() + _DAEMON_START_HANDSHAKE_SECONDS
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            # Daemon exited before we saw the PID file.
+            log_hint = paths.daemon_log_file()
+            typer.echo(
+                f"daemon failed to start (exit code {proc.returncode}); "
+                f"see {log_hint} for clues",
+                err=True,
+            )
+            return 3
+        # Read directly against the explicit path so we don't depend on the
+        # `state` module's default-path bindings (which point at capture.pid).
+        if state.read_pid_file(path=daemon_pid_path) is not None:
+            typer.echo(f"daemon started (PID {proc.pid})")
+            return 0
+        time.sleep(_DAEMON_START_POLL_INTERVAL)
+
+    # Window elapsed without the daemon writing its PID file *or* exiting.
+    # Treat as a soft success: the daemon may simply be slow on first launch.
+    # We surface a warning to stderr but still exit 0 — the user can re-check
+    # with `record status` once that lands in slice 2.
+    typer.echo(
+        f"daemon spawned (PID {proc.pid}) but PID file did not appear within "
+        f"{_DAEMON_START_HANDSHAKE_SECONDS:.0f}s — check {paths.daemon_log_file()}",
+        err=True,
+    )
+    return 0
+
+
+def _daemon_stop_impl() -> int:
+    """Send SIGTERM to the daemon and wait for it to exit.
+
+    Returns the would-be CLI exit code. The daemon removes its own PID file
+    in its cleanup path; this function does not race that.
+    """
+    daemon_pid_path = paths.daemon_pid_file()
+    pid = state.read_pid_file(path=daemon_pid_path)
+    if pid is None:
+        typer.echo("daemon is not running", err=True)
+        return 1
+
+    if not state.is_alive(pid):
+        state.remove_pid_file(path=daemon_pid_path)
+        typer.echo("daemon is not running (stale PID cleaned up)", err=True)
+        return 1
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        state.remove_pid_file(path=daemon_pid_path)
+        typer.echo("daemon is not running (process disappeared)", err=True)
+        return 1
+
+    deadline = time.monotonic() + _STOP_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if not state.is_alive(pid):
+            break
+        time.sleep(_STOP_POLL_INTERVAL)
+    else:
+        typer.echo(
+            f"daemon (PID {pid}) did not exit within "
+            f"{_STOP_TIMEOUT_SECONDS:.0f}s — inspect "
+            f"{paths.daemon_log_file()} for clues",
+            err=True,
+        )
+        return 4
+
+    typer.echo("daemon stopped")
+    return 0
+
+
+@daemon_app.command("start")
+def daemon_start() -> None:
+    """Launch the background daemon for this login session."""
+    code = _daemon_start_impl()
+    if code != 0:
+        raise typer.Exit(code=code)
+
+
+@daemon_app.command("stop")
+def daemon_stop() -> None:
+    """Stop the running daemon."""
+    code = _daemon_stop_impl()
+    if code != 0:
+        raise typer.Exit(code=code)
+
+
+@daemon_app.command("restart")
+def daemon_restart() -> None:
+    """Stop the daemon (if running) and start a fresh one."""
+    stop_code = _daemon_stop_impl()
+    # `not running` (code 1) is fine for restart — it's also a way to start a
+    # freshly-installed daemon. Anything else (e.g. timeout=4) is fatal.
+    if stop_code not in (0, 1):
+        raise typer.Exit(code=stop_code)
+    start_code = _daemon_start_impl()
+    if start_code != 0:
+        raise typer.Exit(code=start_code)

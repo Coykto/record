@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -50,27 +51,53 @@ def _build_handler(log_path: Any) -> logging.handlers.RotatingFileHandler:
     return handler
 
 
-def configure_logging() -> None:
+def configure_logging(log_path: Path | None = None) -> None:
     """Install the structlog -> rotating-JSON-file pipeline.
 
     Safe to call multiple times: subsequent calls are no-ops once the handler
     is in place.
+
+    Parameters
+    ----------
+    log_path:
+        Optional override of the rotating-file destination. When ``None`` (the
+        default), the legacy ``~/Library/Logs/record/orchestrator.log`` is used
+        and :func:`paths.ensure_dirs` is invoked to materialise the parent
+        directory. When set (e.g. by the spec-003 daemon pointing at
+        ``~/record/logs/daemon.log``), the parent directory is created
+        explicitly and :func:`paths.ensure_dirs` is **not** called — the
+        daemon has its own ``ensure_daemon_dirs`` helper for that.
     """
     global _configured
 
-    # Make sure the log directory exists before any handler tries to write.
-    paths.ensure_dirs()
-    log_path = paths.orchestrator_log()
+    if log_path is None:
+        # Make sure the log directory exists before any handler tries to write.
+        paths.ensure_dirs()
+        target = paths.orchestrator_log()
+    else:
+        target = log_path
+        target.parent.mkdir(parents=True, exist_ok=True)
 
     root = logging.getLogger()
 
-    # Idempotency: if our tagged handler is already attached, we're done.
-    for existing in root.handlers:
+    # Idempotency: if our tagged handler is already attached pointing at the
+    # same file, we're done. If a tagged handler exists for a *different* file
+    # (e.g. tests reconfigured between sessions), swap it.
+    for existing in list(root.handlers):
         if getattr(existing, _HANDLER_TAG, False):
-            _configured = True
-            return
+            existing_path = getattr(existing, "baseFilename", None)
+            if existing_path == str(target):
+                _configured = True
+                return
+            # Different target — detach the stale handler before installing
+            # the new one so we don't write to two files in parallel.
+            root.removeHandler(existing)
+            try:
+                existing.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
 
-    handler = _build_handler(log_path)
+    handler = _build_handler(target)
     root.addHandler(handler)
     root.setLevel(logging.INFO)
 

@@ -578,3 +578,288 @@ def test_stop_exits_2_on_permission_denied(
     assert "System Settings" in result.stderr
     assert not fake_paths["pid"].exists()
     assert not fake_paths["state"].exists()
+
+
+# ---------------------------------------------------------------------------
+# `record daemon start/stop/restart` — spec 003 slice 1
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_daemon_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, Path]:
+    """Redirect every daemon-side path the CLI consults.
+
+    Distinct from ``fake_paths`` because the daemon's PID file lives at a
+    different path than the supervisor's, and we never want the CLI tests to
+    create files inside the user's real ``~/Library/Application Support`` or
+    ``~/record/`` directories.
+    """
+    daemon_pid = tmp_path / "daemon.pid"
+    daemon_log = tmp_path / "logs" / "daemon.log"
+    daemon_log_dir = daemon_log.parent
+
+    monkeypatch.setattr(paths, "daemon_pid_file", lambda: daemon_pid)
+    monkeypatch.setattr(paths, "daemon_log_file", lambda: daemon_log)
+    monkeypatch.setattr(paths, "daemon_log_dir", lambda: daemon_log_dir)
+    return {
+        "pid": daemon_pid,
+        "log": daemon_log,
+        "log_dir": daemon_log_dir,
+        "root": tmp_path,
+    }
+
+
+class _FakePopen:
+    """Minimal `subprocess.Popen` stub for daemon-spawn tests.
+
+    Records argv on construction and reports `poll() is None` so the CLI's
+    handshake loop treats the daemon as healthy. Tests that want to simulate
+    a failed launch can post-hoc set `_returncode` to a non-None value.
+    """
+
+    instances: list["_FakePopen"] = []
+
+    def __init__(self, argv: list[str], **kwargs: Any) -> None:
+        self.argv = argv
+        self.kwargs = kwargs
+        self.pid = 4242  # arbitrary; tests never call os.kill against it
+        self._returncode: int | None = None
+        _FakePopen.instances.append(self)
+
+    def poll(self) -> int | None:
+        return self._returncode
+
+    @property
+    def returncode(self) -> int | None:
+        return self._returncode
+
+
+@pytest.fixture
+def fake_popen(monkeypatch: pytest.MonkeyPatch) -> type[_FakePopen]:
+    """Replace `cli.subprocess.Popen` with the recording stub.
+
+    Tests opt into "writes the PID file on construction" by composing their
+    own wrapper around the stub; the bare fixture just records argv.
+    """
+    _FakePopen.instances.clear()
+    monkeypatch.setattr(cli.subprocess, "Popen", _FakePopen)
+    return _FakePopen
+
+
+def test_daemon_start_spawns_daemon_module(
+    fake_daemon_paths: dict[str, Path],
+    fake_popen: type[_FakePopen],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Happy path: no existing PID file → Popen called → handshake sees the
+    PID file appear → CLI prints "daemon started" and exits 0."""
+
+    # Wrap Popen so it materialises the daemon PID file on construction —
+    # this is what the real daemon does in its startup path. Without it, the
+    # handshake would time out (the test would still exit 0 with a warning,
+    # but we want to exercise the happy "PID file appeared" branch).
+    real_init = _FakePopen.__init__
+
+    def _init_with_pidfile(self: _FakePopen, argv: list[str], **kwargs: Any) -> None:
+        real_init(self, argv, **kwargs)
+        fake_daemon_paths["pid"].write_text(f"{self.pid}\n", encoding="utf-8")
+
+    monkeypatch.setattr(_FakePopen, "__init__", _init_with_pidfile)
+
+    result = runner.invoke(cli.app, ["daemon", "start"])
+    assert result.exit_code == 0, result.stderr
+    assert "daemon started" in result.stdout
+    assert "PID 4242" in result.stdout
+
+    # The CLI spawned `python -m record.daemon` exactly once.
+    assert len(_FakePopen.instances) == 1
+    argv = _FakePopen.instances[0].argv
+    assert argv[1:] == ["-m", "record.daemon"]
+
+
+def test_daemon_start_when_already_running_prints_message_and_skips_spawn(
+    fake_daemon_paths: dict[str, Path], fake_popen: type[_FakePopen]
+) -> None:
+    """A PID file pointing at a live process → "daemon already running", no spawn."""
+    fake_daemon_paths["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    result = runner.invoke(cli.app, ["daemon", "start"])
+    assert result.exit_code == 0
+    assert "daemon already running" in result.stdout
+    assert str(os.getpid()) in result.stdout
+    # Popen must NOT have been called.
+    assert _FakePopen.instances == []
+
+
+def test_daemon_start_clears_stale_pid_file_before_spawn(
+    fake_daemon_paths: dict[str, Path],
+    fake_popen: type[_FakePopen],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stale PID file (dead PID) → CLI clears it, spawns, succeeds."""
+    assert not state.is_alive(_DEAD_PID)
+    fake_daemon_paths["pid"].write_text(f"{_DEAD_PID}\n", encoding="utf-8")
+
+    real_init = _FakePopen.__init__
+
+    def _init_with_pidfile(self: _FakePopen, argv: list[str], **kwargs: Any) -> None:
+        real_init(self, argv, **kwargs)
+        fake_daemon_paths["pid"].write_text(f"{self.pid}\n", encoding="utf-8")
+
+    monkeypatch.setattr(_FakePopen, "__init__", _init_with_pidfile)
+
+    result = runner.invoke(cli.app, ["daemon", "start"])
+    assert result.exit_code == 0, result.stderr
+    assert "daemon started" in result.stdout
+    assert len(_FakePopen.instances) == 1
+    # Stale PID was overwritten with the new daemon's PID, not the dead one.
+    assert int(fake_daemon_paths["pid"].read_text().strip()) == 4242
+
+
+def test_daemon_stop_exits_nonzero_when_no_pid_file(
+    fake_daemon_paths: dict[str, Path],
+) -> None:
+    result = runner.invoke(cli.app, ["daemon", "stop"])
+    assert result.exit_code != 0
+    assert "daemon is not running" in result.stderr
+
+
+def test_daemon_stop_exits_nonzero_on_stale_pid_file(
+    fake_daemon_paths: dict[str, Path],
+) -> None:
+    assert not state.is_alive(_DEAD_PID)
+    fake_daemon_paths["pid"].write_text(f"{_DEAD_PID}\n", encoding="utf-8")
+    result = runner.invoke(cli.app, ["daemon", "stop"])
+    assert result.exit_code != 0
+    assert "stale" in result.stderr.lower()
+    assert not fake_daemon_paths["pid"].exists()
+
+
+def test_daemon_stop_happy_path(
+    fake_daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live PID + stubbed os.kill + is_alive flipping True→False → exit 0."""
+    fake_daemon_paths["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    calls: dict[str, int] = {"is_alive": 0}
+
+    def _fake_is_alive(pid: int) -> bool:  # noqa: ARG001
+        calls["is_alive"] += 1
+        return calls["is_alive"] == 1
+
+    monkeypatch.setattr(state, "is_alive", _fake_is_alive)
+    monkeypatch.setattr(cli.state, "is_alive", _fake_is_alive)
+    monkeypatch.setattr(cli.os, "kill", lambda *a, **k: None)
+
+    result = runner.invoke(cli.app, ["daemon", "stop"])
+    assert result.exit_code == 0, result.stderr
+    assert "daemon stopped" in result.stdout
+
+
+def test_daemon_stop_timeout_exits_4(
+    fake_daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """is_alive stays True past _STOP_TIMEOUT_SECONDS → exit code 4."""
+    fake_daemon_paths["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "_STOP_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(cli, "_STOP_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(cli.os, "kill", lambda *a, **k: None)
+
+    result = runner.invoke(cli.app, ["daemon", "stop"])
+    assert result.exit_code == 4
+    assert "did not exit" in result.stderr
+
+
+def test_daemon_restart_chains_stop_and_start(
+    fake_daemon_paths: dict[str, Path],
+    fake_popen: type[_FakePopen],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live PID → stop succeeds → start spawns → restart exits 0."""
+    fake_daemon_paths["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    # `is_alive` flips True→False after the first probe so the stop polling
+    # loop terminates immediately, then stays False so the start path's
+    # initial "already running?" check sees no live PID.
+    calls: dict[str, int] = {"is_alive": 0}
+
+    def _fake_is_alive(pid: int) -> bool:  # noqa: ARG001
+        calls["is_alive"] += 1
+        return calls["is_alive"] == 1
+
+    monkeypatch.setattr(state, "is_alive", _fake_is_alive)
+    monkeypatch.setattr(cli.state, "is_alive", _fake_is_alive)
+    monkeypatch.setattr(cli.os, "kill", lambda *a, **k: None)
+
+    # The stop path doesn't clean up the PID file (the daemon would, but
+    # there's no real daemon here). Simulate the daemon's cleanup by removing
+    # the PID file inside our fake kill — well, easier: have Popen overwrite
+    # it on spawn. But the start path checks `read_pid_file` first; with
+    # is_alive returning False on call #2 (the start path's check), the
+    # stale-recovery branch kicks in and clears the file before spawning.
+    real_init = _FakePopen.__init__
+
+    def _init_with_pidfile(self: _FakePopen, argv: list[str], **kwargs: Any) -> None:
+        real_init(self, argv, **kwargs)
+        fake_daemon_paths["pid"].write_text(f"{self.pid}\n", encoding="utf-8")
+
+    monkeypatch.setattr(_FakePopen, "__init__", _init_with_pidfile)
+
+    result = runner.invoke(cli.app, ["daemon", "restart"])
+    assert result.exit_code == 0, result.stderr
+    assert "daemon stopped" in result.stdout
+    assert "daemon started" in result.stdout
+    assert len(_FakePopen.instances) == 1
+
+
+def test_daemon_restart_when_not_running_just_starts(
+    fake_daemon_paths: dict[str, Path],
+    fake_popen: type[_FakePopen],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No PID file at all → restart treats "not running" as fine and starts fresh."""
+    real_init = _FakePopen.__init__
+
+    def _init_with_pidfile(self: _FakePopen, argv: list[str], **kwargs: Any) -> None:
+        real_init(self, argv, **kwargs)
+        fake_daemon_paths["pid"].write_text(f"{self.pid}\n", encoding="utf-8")
+
+    monkeypatch.setattr(_FakePopen, "__init__", _init_with_pidfile)
+
+    result = runner.invoke(cli.app, ["daemon", "restart"])
+    assert result.exit_code == 0, result.stderr
+    assert "daemon started" in result.stdout
+    # Stop printed its "not running" line to stderr, but exit was still 0
+    # because restart treats not-running as fine.
+    assert "daemon is not running" in result.stderr
+
+
+def test_daemon_start_does_not_touch_capture_pid_file(
+    fake_paths: dict[str, Path],
+    fake_daemon_paths: dict[str, Path],
+    fake_popen: type[_FakePopen],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Critical isolation test: `record daemon start` must not interfere with
+    the legacy supervisor's capture.pid bookkeeping.
+    """
+    # Seed a "live capture" via the legacy PID file.
+    fake_paths["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
+    assert fake_paths["pid"].exists()
+
+    real_init = _FakePopen.__init__
+
+    def _init_with_pidfile(self: _FakePopen, argv: list[str], **kwargs: Any) -> None:
+        real_init(self, argv, **kwargs)
+        fake_daemon_paths["pid"].write_text(f"{self.pid}\n", encoding="utf-8")
+
+    monkeypatch.setattr(_FakePopen, "__init__", _init_with_pidfile)
+
+    result = runner.invoke(cli.app, ["daemon", "start"])
+    assert result.exit_code == 0, result.stderr
+    # Legacy capture.pid is untouched.
+    assert fake_paths["pid"].exists()
+    assert fake_paths["pid"].read_text().strip() == str(os.getpid())
