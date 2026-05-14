@@ -29,9 +29,12 @@ production code growing a "test mode" branch.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import os
 import shlex
+import signal
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -85,7 +88,18 @@ def _resolve_binary() -> Path | None:
     other.
     """
     try:
-        resource = files("record") / "bin" / "record-capture"
+        # The binary ships inside a .app bundle so macOS TCC attributes its
+        # permission requests to the bundle's own identity (com.record.capture)
+        # rather than walking up to the parent python3 process, which carries
+        # no Info.plist / NSMicrophoneUsageDescription.
+        resource = (
+            files("record")
+            / "bin"
+            / "record-capture.app"
+            / "Contents"
+            / "MacOS"
+            / "record-capture"
+        )
     except (ModuleNotFoundError, FileNotFoundError):
         return None
     try:
@@ -98,7 +112,243 @@ def _resolve_binary() -> Path | None:
         return None
 
 
-def _drain_stderr(proc: subprocess.Popen[str], log_path: Path) -> None:
+# ---------------------------------------------------------------------------
+# Disclaiming spawn — macOS TCC "responsible process" handling
+# ---------------------------------------------------------------------------
+#
+# A plain ``subprocess.Popen`` leaves the Swift child's TCC *responsible
+# process* as this Python orchestrator (and, when autostarted, launchd).
+# macOS then consults *that* process's bundle for permission grants — and the
+# uv-managed standalone python has no Info.plist at all, so the capture
+# binary's own ``com.record.capture`` grants are never seen. The symptom: the
+# microphone prompt fast-fails for the launchd-spawned daemon even though the
+# grant exists.
+#
+# ``posix_spawn`` with ``responsibility_spawnattrs_setdisclaim`` makes the
+# spawned child its *own* responsible process, so TCC keys permission grants
+# on the capture binary's bundle identity regardless of who launched the
+# daemon. This is the only fix that works without a full Developer ID
+# signature (which the project defers).
+
+# macOS <spawn.h>: spawn the child into a new session (replaces Popen's
+# start_new_session=True).
+_POSIX_SPAWN_SETSID = 0x0400
+
+
+class _DisclaimUnavailable(RuntimeError):
+    """Raised when disclaiming spawn is not available (non-macOS, or the
+    private ``responsibility_spawnattrs_setdisclaim`` symbol is missing). The
+    caller falls back to a plain ``subprocess.Popen``."""
+
+
+def _exit_status_to_returncode(status: int) -> int:
+    """Map a raw ``os.waitpid`` status to a Popen-style return code."""
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    return -1
+
+
+def _posix_spawn_disclaimed(
+    argv: list[str], *, stdin_fd: int, stdout_fd: int, stderr_fd: int
+) -> int:
+    """``posix_spawn`` ``argv`` with the responsibility-disclaim attribute set.
+
+    ``stdin_fd`` / ``stdout_fd`` / ``stderr_fd`` are the child-side pipe fds
+    to wire onto descriptors 0/1/2. Returns the child pid. Raises
+    :class:`_DisclaimUnavailable` when the platform/symbol can't support it,
+    or :class:`OSError` on a genuine spawn failure.
+    """
+    if sys.platform != "darwin":
+        raise _DisclaimUnavailable("disclaiming spawn is macOS-only")
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        _disclaim = libc.responsibility_spawnattrs_setdisclaim
+    except AttributeError as exc:
+        raise _DisclaimUnavailable(
+            "responsibility_spawnattrs_setdisclaim not available"
+        ) from exc
+
+    _voidpp = ctypes.POINTER(ctypes.c_void_p)
+    libc.posix_spawn_file_actions_init.argtypes = [_voidpp]
+    libc.posix_spawn_file_actions_adddup2.argtypes = [
+        _voidpp, ctypes.c_int, ctypes.c_int
+    ]
+    libc.posix_spawn_file_actions_destroy.argtypes = [_voidpp]
+    libc.posix_spawnattr_init.argtypes = [_voidpp]
+    libc.posix_spawnattr_setflags.argtypes = [_voidpp, ctypes.c_short]
+    libc.posix_spawnattr_destroy.argtypes = [_voidpp]
+    _disclaim.argtypes = [_voidpp, ctypes.c_int]
+    libc.posix_spawn.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_char_p,
+        _voidpp,
+        _voidpp,
+        ctypes.POINTER(ctypes.c_char_p),
+        ctypes.POINTER(ctypes.c_char_p),
+    ]
+
+    file_actions = ctypes.c_void_p()
+    attr = ctypes.c_void_p()
+    libc.posix_spawn_file_actions_init(ctypes.byref(file_actions))
+    libc.posix_spawnattr_init(ctypes.byref(attr))
+    try:
+        for src, dst in ((stdin_fd, 0), (stdout_fd, 1), (stderr_fd, 2)):
+            libc.posix_spawn_file_actions_adddup2(
+                ctypes.byref(file_actions), src, dst
+            )
+        # Make the child its own TCC responsible process, and give it its own
+        # session (parity with the previous Popen start_new_session=True).
+        _disclaim(ctypes.byref(attr), 1)
+        libc.posix_spawnattr_setflags(
+            ctypes.byref(attr), _POSIX_SPAWN_SETSID
+        )
+
+        argv_c = (ctypes.c_char_p * (len(argv) + 1))()
+        for i, a in enumerate(argv):
+            argv_c[i] = a.encode()
+        env_items = [f"{k}={v}".encode() for k, v in os.environ.items()]
+        envp_c = (ctypes.c_char_p * (len(env_items) + 1))()
+        for i, e in enumerate(env_items):
+            envp_c[i] = e
+
+        pid = ctypes.c_int()
+        rc = libc.posix_spawn(
+            ctypes.byref(pid),
+            argv[0].encode(),
+            ctypes.byref(file_actions),
+            ctypes.byref(attr),
+            argv_c,
+            envp_c,
+        )
+    finally:
+        libc.posix_spawn_file_actions_destroy(ctypes.byref(file_actions))
+        libc.posix_spawnattr_destroy(ctypes.byref(attr))
+
+    if rc != 0:
+        raise OSError(rc, os.strerror(rc), argv[0])
+    return pid.value
+
+
+class _DisclaimedChild:
+    """A ``subprocess.Popen``-compatible handle for a child spawned via
+    :func:`_posix_spawn_disclaimed`.
+
+    Implements only the surface :class:`SwiftChild` uses: text-mode
+    ``stdin`` / ``stdout`` / ``stderr`` streams, ``poll()``, ``wait()``,
+    ``send_signal()`` / ``terminate()`` / ``kill()``, ``pid``, ``returncode``.
+    """
+
+    def __init__(self, argv: list[str]) -> None:
+        # stdin: parent writes stdin_w, child reads stdin_r. stdout/stderr:
+        # child writes *_w, parent reads *_r.
+        stdin_r, stdin_w = os.pipe()
+        stdout_r, stdout_w = os.pipe()
+        stderr_r, stderr_w = os.pipe()
+        try:
+            pid = _posix_spawn_disclaimed(
+                argv, stdin_fd=stdin_r, stdout_fd=stdout_w, stderr_fd=stderr_w
+            )
+        except BaseException:
+            for fd in (
+                stdin_r, stdin_w, stdout_r, stdout_w, stderr_r, stderr_w
+            ):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
+
+        # Child-side ends now live in the child; close our copies so the read
+        # pipes see EOF when the child exits.
+        os.close(stdin_r)
+        os.close(stdout_w)
+        os.close(stderr_w)
+
+        self.args: list[str] = list(argv)
+        self.pid: int = pid
+        self.returncode: int | None = None
+        # Line-buffered text streams — parity with Popen(text=True, bufsize=1).
+        self.stdin = os.fdopen(stdin_w, "w", buffering=1, encoding="utf-8")
+        self.stdout = os.fdopen(stdout_r, "r", buffering=1, encoding="utf-8")
+        self.stderr = os.fdopen(stderr_r, "r", buffering=1, encoding="utf-8")
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        try:
+            wpid, status = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            # Already reaped — shouldn't happen (we are the sole owner), but
+            # don't wedge the caller if it does.
+            self.returncode = -1
+            return self.returncode
+        if wpid == 0:
+            return None
+        self.returncode = _exit_status_to_returncode(status)
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is not None:
+            return self.returncode
+        if timeout is None:
+            _, status = os.waitpid(self.pid, 0)
+            self.returncode = _exit_status_to_returncode(status)
+            return self.returncode
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            rc = self.poll()
+            if rc is not None:
+                return rc
+            time.sleep(0.02)
+        raise subprocess.TimeoutExpired(self.args, timeout)
+
+    def send_signal(self, sig: int) -> None:
+        if self.returncode is not None:
+            return
+        try:
+            os.kill(self.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    def terminate(self) -> None:
+        self.send_signal(signal.SIGTERM)
+
+    def kill(self) -> None:
+        self.send_signal(signal.SIGKILL)
+
+
+# A running Swift child is either our disclaiming wrapper (the macOS norm) or a
+# plain Popen (the fallback path). Both are duck-type compatible for the
+# surface SwiftChild uses.
+_SwiftProc = subprocess.Popen[str] | _DisclaimedChild
+
+
+def _spawn_swift_child(argv: list[str]) -> _SwiftProc:
+    """Spawn the Swift capture binary as its own TCC responsible process.
+
+    Uses :class:`_DisclaimedChild` (``posix_spawn`` + disclaim) on macOS; falls
+    back to a plain ``subprocess.Popen`` when disclaiming spawn is unavailable
+    — degraded (TCC may misattribute) but never worse than the prior behavior.
+    """
+    try:
+        return _DisclaimedChild(argv)
+    except _DisclaimUnavailable:
+        _log.warning("disclaim_spawn_unavailable_falling_back")
+        return subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+
+
+def _drain_stderr(proc: _SwiftProc, log_path: Path) -> None:
     """Append the binary's stderr line-by-line to the daemon log file.
 
     Runs in a background thread for the lifetime of the subprocess. IO errors
@@ -291,7 +541,7 @@ def _log_event(event: ipc.Event) -> None:
         _log.info(name, **payload)
 
 
-def _send_command(proc: subprocess.Popen[str], cmd: ipc.Command) -> None:
+def _send_command(proc: _SwiftProc, cmd: ipc.Command) -> None:
     """Write a single command line to the binary's stdin and flush."""
     assert proc.stdin is not None
     line = ipc.serialize_command(cmd) + "\n"
@@ -365,7 +615,7 @@ class SwiftChild:
         self._daemon_log_path = daemon_log_path
         self._daemon_mode = daemon
 
-        self._proc: subprocess.Popen[str] | None = None
+        self._proc: _SwiftProc | None = None
         self._stderr_thread: threading.Thread | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._watcher_task: asyncio.Task[None] | None = None
@@ -409,7 +659,7 @@ class SwiftChild:
         return self._daemon_mode
 
     @property
-    def proc(self) -> subprocess.Popen[str] | None:
+    def proc(self) -> _SwiftProc | None:
         return self._proc
 
     async def start(self) -> None:
@@ -593,15 +843,7 @@ class SwiftChild:
             extra_argv=argv[1:],
         )
 
-        proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
+        proc = _spawn_swift_child(argv)
         self._proc = proc
 
         # Fresh per-spawn events. The session's reader-task races against
@@ -770,7 +1012,7 @@ class SwiftChild:
             _log.error("swift_child_respawn_failed", error=str(exc))
 
     async def _wait_proc(
-        self, proc: subprocess.Popen[str], *, timeout: float
+        self, proc: _SwiftProc, *, timeout: float
     ) -> None:
         """Wait up to ``timeout`` seconds for the binary to exit."""
         loop = asyncio.get_running_loop()
@@ -915,6 +1157,13 @@ class CaptureSession:
         # dead child.
         self._child_exited_event = asyncio.Event()
         self._child_exited_abnormally = False
+        # Set when the Swift child emits an ``error`` event before ``started``
+        # — a start failure (e.g. a permission denial) that, in daemon mode,
+        # leaves the child alive rather than exiting. Races against
+        # _started_event so start() doesn't hang waiting for a ``started`` that
+        # will never arrive.
+        self._start_failed_event = asyncio.Event()
+        self._start_error: str | None = None
 
     # ----- Public surface -------------------------------------------------
 
@@ -960,6 +1209,14 @@ class CaptureSession:
         if isinstance(event, ipc.StoppedEvent):
             self._saw_stopped = True
             self._stopped_event.set()
+
+        if (
+            isinstance(event, ipc.ErrorEvent)
+            and not self._started_event.is_set()
+            and not self._saw_stopped
+        ):
+            self._start_error = event.message
+            self._start_failed_event.set()
 
     def _attach_to_child(self, child: "SwiftChild") -> None:
         """Internal: bind this session to its driving :class:`SwiftChild`.
@@ -1075,19 +1332,37 @@ class CaptureSession:
         # when the SwiftChild watcher sees an exit.
         started_wait = asyncio.create_task(self._started_event.wait())
         exited_wait = asyncio.create_task(self._child_exited_event.wait())
+        start_failed_wait = asyncio.create_task(self._start_failed_event.wait())
         try:
             await asyncio.wait(
-                {started_wait, exited_wait},
+                {started_wait, exited_wait, start_failed_wait},
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            for t in (started_wait, exited_wait):
+            for t in (started_wait, exited_wait, start_failed_wait):
                 if not t.done():
                     t.cancel()
                     try:
                         await t
                     except (asyncio.CancelledError, Exception):
                         pass
+
+        if (
+            self._start_error is not None
+            and not self._started_event.is_set()
+            and not self._saw_stopped
+        ):
+            # The Swift child reported an error before ``started`` (e.g. a
+            # permission denial). In daemon mode the child stays alive, so we
+            # surface the failure cleanly: the daemon resets to IDLE and the
+            # shared child is reusable for the next start.
+            final = dict(self._state)
+            final["final"] = True
+            final["last_event_at"] = _utcnow_iso()
+            self._write_state(final)
+            raise CaptureFailedToStart(
+                self._start_error, final_state=final
+            )
 
         if self._child_exited_abnormally and not self._saw_stopped:
             # The child died before our capture got off the ground.

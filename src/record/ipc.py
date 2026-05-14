@@ -146,7 +146,7 @@ _command_adapter: TypeAdapter[Command] = TypeAdapter(Command)
 
 # Closed enums for event payloads.
 SourceName = Literal["mic", "system_audio"]
-PermissionKind = Literal["microphone", "screen_recording"]
+PermissionKind = Literal["microphone", "screen_recording", "accessibility"]
 VideoReconfigReason = Literal["primary_changed", "resolution_changed", "display_removed"]
 SystemEventReason = Literal["system_sleep", "display_sleep", "screen_locked"]
 

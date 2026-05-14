@@ -17,7 +17,16 @@ import pytest
 
 # Repo root resolution: this file lives at <repo>/tests/integration/conftest.py.
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CAPTURE_BINARY = REPO_ROOT / "src" / "record" / "bin" / "record-capture"
+CAPTURE_BINARY = (
+    REPO_ROOT
+    / "src"
+    / "record"
+    / "bin"
+    / "record-capture.app"
+    / "Contents"
+    / "MacOS"
+    / "record-capture"
+)
 
 
 @pytest.fixture(scope="session")

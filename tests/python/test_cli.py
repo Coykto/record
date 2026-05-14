@@ -885,6 +885,10 @@ def install_sandbox(
 
     monkeypatch.setattr(cli.config_module, "load_config", lambda: cfg)
     monkeypatch.setattr(paths, "daemon_pid_file", lambda: fake_pid)
+    # `record install` primes TCC permissions by spawning the real capture
+    # binary; stub it out so the install tests stay hermetic (no subprocess,
+    # no real TCC interaction). The priming behavior is exercised separately.
+    monkeypatch.setattr(cli, "_prime_permissions", lambda: None)
 
     yield {
         "root": tmp_path,

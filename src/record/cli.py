@@ -22,6 +22,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +31,7 @@ from typing import Any
 import typer
 
 from . import config as config_module
-from . import control, launchagent, paths, state
+from . import capture, control, ipc, launchagent, paths, state
 
 app = typer.Typer(help="record: privacy-first meeting recorder")
 
@@ -446,6 +447,120 @@ def status() -> None:
 # `record install` / `record uninstall` — spec 003 slice 7
 # ---------------------------------------------------------------------------
 
+# Hard cap on the prime subprocess, which walks the user through the
+# Microphone / Accessibility / Screen Recording prompts one at a time (each
+# polls and exits early the moment its grant lands). Just a kill-switch for a
+# user who walks away mid-install — generous so a slow-but-present user is
+# never cut off.
+_PRIME_TIMEOUT_SECONDS = 300
+
+
+def _prime_permissions() -> None:
+    """Trigger the Screen Recording + Microphone TCC prompts before bootstrap.
+
+    macOS will not present TCC permission UI to a launchd-spawned process, so a
+    daemon started purely via ``launchctl bootstrap`` can never prompt for the
+    microphone. ``record install`` runs from a terminal-rooted process tree, so
+    we spawn the capture binary here with ``--prime-permissions`` to surface the
+    prompts while we still can.
+
+    The spawn goes through the same disclaiming ``posix_spawn`` path the daemon
+    uses (:func:`capture._spawn_swift_child`) so the priming process and the
+    launchd daemon's Swift child resolve to the *same* TCC responsible
+    process — the capture binary's own ``com.record.capture`` identity. Prime
+    without disclaim and the grant would land on a different identity than the
+    one the daemon checks.
+
+    Best-effort: a missing binary, a timeout, or a denied permission is
+    reported but does not abort the install — the LaunchAgent is still useful
+    once the user grants the permission and the daemon restarts.
+    """
+    binary = capture._resolve_binary()
+    if binary is None:
+        typer.echo(
+            "warning: capture binary not found — skipping permission priming",
+            err=True,
+        )
+        return
+
+    typer.echo("priming permissions — approve the macOS prompts if they appear...")
+    proc = capture._spawn_swift_child([str(binary), "--prime-permissions"])
+
+    # Drain stdout (event lines) and stderr (live `[prime]` progress) on
+    # threads so a hung prompt can't wedge us past the timeout, and so the
+    # user gets per-permission feedback instead of an opaque wait.
+    stdout_lines: list[str] = []
+
+    def _drain_stdout() -> None:
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                stdout_lines.append(line)
+        except Exception:
+            pass
+
+    def _drain_stderr() -> None:
+        try:
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                line = line.strip()
+                # The Swift prime emits `[prime] <permission>: <status>` lines
+                # as each permission settles — echo them as live progress.
+                if line.startswith("[prime]"):
+                    typer.echo(f"  {line[len('[prime]'):].strip()}")
+        except Exception:
+            pass
+
+    readers = [
+        threading.Thread(target=_drain_stdout, name="record-prime-out", daemon=True),
+        threading.Thread(target=_drain_stderr, name="record-prime-err", daemon=True),
+    ]
+    for r in readers:
+        r.start()
+
+    try:
+        returncode = proc.wait(timeout=_PRIME_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        for r in readers:
+            r.join(timeout=2.0)
+        typer.echo(
+            "warning: permission priming timed out waiting for a response",
+            err=True,
+        )
+        return
+    for r in readers:
+        r.join(timeout=2.0)
+
+    if returncode == 0:
+        typer.echo("permissions: screen recording + microphone granted")
+        return
+
+    denied: set[str] = set()
+    for line in stdout_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = ipc.parse_event(line)
+        except Exception:
+            continue
+        if isinstance(event, ipc.PermissionDeniedEvent):
+            denied.add(event.kind.replace("_", " "))
+
+    if denied:
+        typer.echo(
+            f"warning: permission not granted: {', '.join(sorted(denied))}",
+            err=True,
+        )
+    else:
+        typer.echo("warning: permissions not fully granted", err=True)
+    typer.echo(
+        "  grant them in System Settings → Privacy & Security, "
+        "then re-run `record install`",
+        err=True,
+    )
+
 
 @app.command()
 def install() -> None:
@@ -455,6 +570,10 @@ def install() -> None:
     into the per-user launchd domain (``launchctl bootstrap gui/$UID``). Re-runs
     safely: if the agent is already loaded, the bootstrap is preceded by a
     bootout so plist edits get picked up.
+
+    Before bootstrapping, the macOS TCC prompts for Screen Recording and
+    Microphone are primed from this terminal-rooted process — a launchd-spawned
+    daemon cannot present those prompts itself.
     """
     try:
         cfg = config_module.load_config()
@@ -469,6 +588,9 @@ def install() -> None:
     except config_module.ConfigError as exc:
         typer.echo(f"config error: {exc}", err=True)
         raise typer.Exit(code=2) from None
+
+    # Prime TCC permissions before the daemon is bootstrapped under launchd.
+    _prime_permissions()
 
     result = launchagent.install(cfg)
     if not result.success:

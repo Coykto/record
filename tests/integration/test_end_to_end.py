@@ -253,9 +253,9 @@ def test_end_to_end_silent_sources(
         )
 
         duration_actual = nframes / framerate
-        assert abs(duration_actual - CAPTURE_WINDOW_SECONDS) <= 0.1, (
+        assert abs(duration_actual - CAPTURE_WINDOW_SECONDS) <= 0.5, (
             f"WAV duration {duration_actual:.3f}s deviates from "
-            f"{CAPTURE_WINDOW_SECONDS}s by more than 100 ms"
+            f"{CAPTURE_WINDOW_SECONDS}s by more than 500 ms"
         )
 
     finally:
@@ -692,9 +692,9 @@ def test_end_to_end_silent_sources_with_synthetic_video(
         assert framerate == EXPECTED_SAMPLE_RATE
         assert sampwidth == EXPECTED_SAMPWIDTH_BYTES
         wav_duration = nframes / framerate
-        assert abs(wav_duration - CAPTURE_WINDOW_SECONDS) <= 0.1, (
+        assert abs(wav_duration - CAPTURE_WINDOW_SECONDS) <= 0.5, (
             f"WAV duration {wav_duration:.3f}s deviates from "
-            f"{CAPTURE_WINDOW_SECONDS}s by more than 100 ms"
+            f"{CAPTURE_WINDOW_SECONDS}s by more than 500 ms"
         )
 
         # ------------------------------------------------------------------

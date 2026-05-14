@@ -1,5 +1,6 @@
 import Foundation
 import ScreenCaptureKit
+import AppKit
 
 // MARK: - Stdout: line-buffered, single-line JSON events
 
@@ -74,6 +75,19 @@ struct CLIFlags {
     /// and `--test-synthetic-video`. Absent the flag, behavior is bit-for-bit
     /// unchanged from the legacy one-shot mode (`exit(0)` after `stopped`).
     var daemon: Bool = false
+    /// When true, the binary runs in **permission-priming mode**: it runs the
+    /// Screen Recording and Microphone preflights (which present the macOS TCC
+    /// prompts), emits the resulting `permission_required` / `permission_denied`
+    /// events, then exits — 0 if both are granted, 1 otherwise. It does NOT
+    /// capture anything. `record install` invokes this from its terminal-rooted
+    /// process tree, because a launchd-spawned daemon cannot present TCC UI.
+    var primePermissions: Bool = false
+    /// When true, the binary does one thing and exits: report Screen Recording
+    /// authorization via the exit code (0 = granted, 1 = not). It is spawned
+    /// repeatedly by the permission-priming poll — `CGPreflightScreenCaptureAccess`
+    /// caches at process launch, so a *fresh* process is the only way to observe
+    /// a grant made after priming started.
+    var checkScreenRecording: Bool = false
 }
 
 /// Parse CLI flags before any IPC begins. Supported flags:
@@ -108,6 +122,17 @@ func parseCLIFlags() -> CLIFlags {
             // Order-independent boolean flag, no value argument. Composes
             // with `--test-silent-sources` and `--test-synthetic-video`.
             flags.daemon = true
+            i += 1
+        case "--prime-permissions":
+            // Order-independent boolean flag, no value argument. Runs the TCC
+            // preflights and exits; see `CLIFlags.primePermissions`.
+            flags.primePermissions = true
+            i += 1
+        case "--check-screen-recording":
+            // Order-independent boolean flag, no value argument. Reports
+            // Screen Recording authorization via the exit code; see
+            // `CLIFlags.checkScreenRecording`.
+            flags.checkScreenRecording = true
             i += 1
         case "--simulate-video-failure-after-seconds":
             // Consume the following positional value. Accept either an Int or
@@ -152,6 +177,29 @@ let testSilentSources = cliFlags.testSilentSources
 /// drops `capture` to nil and leaves the main RunLoop running so another
 /// `start` can be serviced over stdin.
 let daemonMode = cliFlags.daemon
+
+// MARK: - Permission priming
+
+// One-shot Screen Recording probe: report authorization via the exit code and
+// exit immediately. The priming poll spawns this repeatedly — a *fresh*
+// process is the only way to observe a Screen Recording grant made after
+// priming started, since `CGPreflightScreenCaptureAccess` caches at launch.
+if cliFlags.checkScreenRecording {
+    exit(CGPreflightScreenCaptureAccess() ? 0 : 1)
+}
+
+// Permission-priming mode runs before any IPC / capture setup. It exists so
+// `record install` can trigger the Screen Recording + Microphone TCC prompts
+// from its terminal-rooted process tree — macOS will not present TCC UI to a
+// launchd-spawned daemon. The preflights emit the usual `permission_required`
+// / `permission_denied` events; the exit code is 0 only when both are granted.
+if cliFlags.primePermissions {
+    Task {
+        let allGranted = await Permissions.prime(emit: emit)
+        exit(allGranted ? 0 : 1)
+    }
+    dispatchMain()
+}
 
 // MARK: - Video startup error discrimination
 
@@ -332,6 +380,8 @@ func handleStart(
         )
     } catch {
         emit(.error(message: "failed to construct AudioCapture: \(error)"))
+        // Daemon mode: a failed start must not kill the long-lived child.
+        if daemonMode { return }
         exit(1)
     }
 
@@ -521,6 +571,12 @@ func handleStart(
             )
         } catch {
             emit(.error(message: "capture start failed: \(error)"))
+            // Daemon mode: a failed start (e.g. a permission denial thrown by
+            // `checkPermissions()`) must not kill the long-lived child.
+            // `capture` was never assigned on this path, so dropping the local
+            // `audioCapture` on return releases the audio engine; the child
+            // idles, ready to serve the next start.
+            if daemonMode { return }
             exit(1)
         }
     }
@@ -778,4 +834,19 @@ stdinThread.start()
 
 // Drive the main RunLoop so dispatched work, SCStream callbacks delivered to
 // the main queue, and the SIGTERM source all get to run.
-RunLoop.main.run()
+//
+// In daemon mode we run an NSApplication event loop rather than a bare
+// RunLoop. Carbon's `RegisterEventHotKey` delivers `kEventHotKeyPressed`
+// through the HIToolbox application event dispatcher; a plain
+// `RunLoop.main.run()` keeps the process alive but never pumps that
+// dispatcher, so hotkey presses are silently dropped. `.accessory` keeps
+// the process out of the Dock. NSApplication's run loop is a superset of
+// the bare RunLoop — dispatched work, SCStream callbacks and the SIGTERM
+// source all still run. The one-shot path keeps the bare RunLoop unchanged.
+if daemonMode {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    app.run()
+} else {
+    RunLoop.main.run()
+}

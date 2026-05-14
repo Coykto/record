@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from record import control, daemon, logging_setup, paths, state
+from record import control, daemon, launchagent, logging_setup, paths, state
 
 
 @pytest.fixture(autouse=True)
@@ -66,6 +66,12 @@ def daemon_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, P
         log_dir.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(paths, "ensure_daemon_dirs", _ensure)
+
+    # The status handler calls launchagent.is_registered(), which shells out to
+    # `launchctl print`. Pin it to False so daemon unit tests are deterministic
+    # regardless of whether the dev machine actually has the LaunchAgent
+    # installed. A test that needs the registered case can re-patch locally.
+    monkeypatch.setattr(launchagent, "is_registered", lambda: False)
 
     return {"pid": pid, "log": log, "log_dir": log_dir, "root": tmp_path}
 

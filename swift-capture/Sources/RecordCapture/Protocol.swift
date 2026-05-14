@@ -146,6 +146,7 @@ extension Command: Codable {
 enum PermissionKind: String, Codable {
     case microphone
     case screenRecording = "screen_recording"
+    case accessibility
 }
 
 /// Audio source referenced by `source_attached` and `source_lost`.

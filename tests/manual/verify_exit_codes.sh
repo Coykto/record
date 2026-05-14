@@ -22,8 +22,8 @@ PID_FILE="$HOME/Library/Application Support/record/capture.pid"
 STATE_FILE="$HOME/Library/Application Support/record/capture-state.json"
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-BINARY="$REPO_ROOT/src/record/bin/record-capture"
-BINARY_BACKUP="$REPO_ROOT/src/record/bin/record-capture.bak"
+BINARY="$REPO_ROOT/src/record/bin/record-capture.app/Contents/MacOS/record-capture"
+BINARY_BACKUP="$REPO_ROOT/src/record/bin/record-capture.app/Contents/MacOS/record-capture.bak"
 
 TOTAL=0
 PASSED=0
