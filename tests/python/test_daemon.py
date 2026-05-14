@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from record import daemon, logging_setup, paths, state
+from record import control, daemon, logging_setup, paths, state
 
 
 @pytest.fixture(autouse=True)
@@ -220,3 +220,810 @@ def test_remove_pid_file_is_silent_on_missing(daemon_paths: dict[str, Path]) -> 
     assert not daemon_paths["pid"].exists()
     # Must not raise.
     daemon._remove_pid_file(path=daemon_paths["pid"])
+
+
+# ---------------------------------------------------------------------------
+# State-machine tests with a fake CaptureSession
+#
+# Slice 2 of spec 003: the daemon's start/stop dispatch must enforce
+# "exactly one capture at a time" and translate state-machine transitions
+# into the right socket responses.
+#
+# These tests inject a fake CaptureSession via the ``session_factory``
+# constructor parameter so no real Swift subprocess is spawned.
+# ---------------------------------------------------------------------------
+
+
+class _FakeSession:
+    """Stub :class:`record.capture.CaptureSession` for daemon state-machine tests.
+
+    Records ``start()`` / ``stop()`` calls; exposes the same ``stopped_event``
+    seam the real session does so the daemon's watcher coroutine can await
+    it.
+    """
+
+    def __init__(
+        self,
+        *,
+        output_path: Path,
+        video_output_path: Path | None = None,
+        start_delay: float = 0.0,
+        start_raises: BaseException | None = None,
+    ) -> None:
+        self.output_path = output_path
+        self.video_output_path = video_output_path
+        self._start_delay = start_delay
+        self._start_raises = start_raises
+
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.stopped_event = asyncio.Event()
+        self._state: dict[str, object] = {
+            "output_path": str(output_path),
+            "video_output_path": (
+                str(video_output_path) if video_output_path else None
+            ),
+        }
+
+    @property
+    def state(self) -> dict[str, object]:
+        return self._state
+
+    async def start(self) -> None:
+        self.start_calls += 1
+        if self._start_delay:
+            await asyncio.sleep(self._start_delay)
+        if self._start_raises is not None:
+            raise self._start_raises
+
+    async def stop(self) -> dict[str, object]:
+        self.stop_calls += 1
+        self.stopped_event.set()
+        self._state["final"] = True
+        return dict(self._state)
+
+
+def _make_daemon(
+    daemon_paths: dict[str, Path],
+    *,
+    sessions: list[_FakeSession] | None = None,
+    output_folder: Path | None = None,
+    config: object | None = None,
+) -> tuple[daemon.Daemon, list[_FakeSession]]:
+    """Build a :class:`Daemon` with a recording session factory.
+
+    Returns the daemon plus a (live) list that tests can read to inspect the
+    sessions the factory handed out. When ``sessions`` is passed in, the
+    factory pops from it; otherwise it constructs fresh :class:`_FakeSession`
+    objects for each capture.
+
+    ``config`` (slice 6): optional :class:`record.config.Config` whose
+    ``audible_feedback`` flag the daemon consults at every state transition.
+    Pre-slice-6 tests pass ``None`` and get the FR 2.9 default (on).
+    """
+    handed_out: list[_FakeSession] = []
+
+    def _factory(
+        output_path: Path, video_output_path: Path | None
+    ) -> _FakeSession:
+        if sessions:
+            session = sessions.pop(0)
+        else:
+            session = _FakeSession(
+                output_path=output_path,
+                video_output_path=video_output_path,
+            )
+        handed_out.append(session)
+        return session
+
+    d = daemon.Daemon(
+        daemon_log_path=daemon_paths["log"],
+        session_factory=_factory,
+        output_folder=output_folder if output_folder is not None else daemon_paths["root"],
+        config=config,  # type: ignore[arg-type]  # tests inject real Config
+    )
+    return d, handed_out
+
+
+# ---------------------------------------------------------------------------
+# Feedback stub used by the slice-6 tests below
+# ---------------------------------------------------------------------------
+
+
+class _FeedbackStub:
+    """Records every ``play_*`` / ``notify`` call the daemon emits.
+
+    Patched into :mod:`record.daemon`'s ``feedback`` import alias so the
+    daemon's ``self._safe_play_*`` helpers route into it. Each list captures
+    ``enabled=`` for the sound-playback functions so tests can assert the
+    ``audible_feedback`` flag was honored.
+    """
+
+    def __init__(self) -> None:
+        self.start_calls: list[bool] = []
+        self.stop_calls: list[bool] = []
+        self.error_calls: list[bool] = []
+        self.notify_calls: list[str] = []
+
+    def play_start(self, *, enabled: bool = True) -> None:
+        self.start_calls.append(enabled)
+
+    def play_stop(self, *, enabled: bool = True) -> None:
+        self.stop_calls.append(enabled)
+
+    def play_error(self, *, enabled: bool = True) -> None:
+        self.error_calls.append(enabled)
+
+    def notify(self, message: str, *, title: str = "record") -> None:
+        self.notify_calls.append(message)
+
+
+def _install_feedback_stub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> _FeedbackStub:
+    """Replace ``record.daemon.feedback`` with the stub for one test."""
+    stub = _FeedbackStub()
+    monkeypatch.setattr(daemon, "feedback", stub)
+    return stub
+
+
+def test_start_request_while_idle_starts_a_session(
+    daemon_paths: dict[str, Path],
+) -> None:
+    d, sessions = _make_daemon(daemon_paths)
+
+    async def _drive() -> control.ControlResponse:
+        return await d.handle_request(control.StartRequest())
+
+    resp = asyncio.run(_drive())
+    assert resp.status == "ok"
+    assert len(sessions) == 1
+    assert sessions[0].start_calls == 1
+    assert d._state == daemon._CaptureState.RUNNING
+
+
+def test_start_request_while_running_returns_already_running(
+    daemon_paths: dict[str, Path],
+) -> None:
+    """A second start request must not spawn a second session."""
+    d, sessions = _make_daemon(daemon_paths)
+
+    async def _drive() -> tuple[control.ControlResponse, control.ControlResponse]:
+        first = await d.handle_request(control.StartRequest())
+        second = await d.handle_request(control.StartRequest())
+        return first, second
+
+    first, second = asyncio.run(_drive())
+    assert first.status == "ok"
+    assert second.status == "already_running"
+    # Only one session was constructed; only one start() call was issued.
+    assert len(sessions) == 1
+    assert sessions[0].start_calls == 1
+
+
+def test_concurrent_start_requests_only_one_session_wins(
+    daemon_paths: dict[str, Path],
+) -> None:
+    """Two concurrent start requests → exactly one session.start() runs.
+
+    The second request loses the lock and sees one of two consistent
+    responses: ``already_running`` (the first finished STARTING fast enough
+    that the second saw RUNNING) or ``busy`` (the first is still STARTING).
+    Both are acceptable per the contract.
+    """
+    # Slow down the first start so the second request races into it.
+    slow = _FakeSession(
+        output_path=daemon_paths["root"] / "x.wav",
+        start_delay=0.1,
+    )
+    fast = _FakeSession(output_path=daemon_paths["root"] / "y.wav")
+    d, sessions = _make_daemon(daemon_paths, sessions=[slow, fast])
+
+    async def _drive() -> list[control.ControlResponse]:
+        t1 = asyncio.create_task(d.handle_request(control.StartRequest()))
+        # Yield once so t1 enters _handle_start and transitions IDLE -> STARTING
+        # before t2 reads the state.
+        await asyncio.sleep(0)
+        t2 = asyncio.create_task(d.handle_request(control.StartRequest()))
+        return list(await asyncio.gather(t1, t2))
+
+    responses = asyncio.run(_drive())
+    statuses = sorted(r.status for r in responses)
+    # Exactly one ok and one rejection.
+    assert "ok" in statuses
+    rejections = [s for s in statuses if s != "ok"]
+    assert len(rejections) == 1
+    assert rejections[0] in ("already_running", "busy")
+
+    # Only one session was constructed and only one start() ran.
+    assert len(sessions) == 1
+    assert sessions[0].start_calls == 1
+
+
+def test_start_failure_returns_to_idle(
+    daemon_paths: dict[str, Path],
+) -> None:
+    """If the session's start() raises, the daemon snaps back to IDLE."""
+    from record.capture import CaptureFailedToStart
+
+    failing = _FakeSession(
+        output_path=daemon_paths["root"] / "x.wav",
+        start_raises=CaptureFailedToStart("nope"),
+    )
+    d, _sessions = _make_daemon(daemon_paths, sessions=[failing])
+
+    async def _drive() -> control.ControlResponse:
+        return await d.handle_request(control.StartRequest())
+
+    resp = asyncio.run(_drive())
+    assert resp.status == "error"
+    assert d._state == daemon._CaptureState.IDLE
+
+
+def test_stop_request_while_idle_returns_not_running(
+    daemon_paths: dict[str, Path],
+) -> None:
+    d, _sessions = _make_daemon(daemon_paths)
+
+    async def _drive() -> control.ControlResponse:
+        return await d.handle_request(control.StopRequest())
+
+    resp = asyncio.run(_drive())
+    assert resp.status == "not_running"
+
+
+def test_stop_request_after_start_returns_ok_and_returns_to_idle(
+    daemon_paths: dict[str, Path],
+) -> None:
+    d, sessions = _make_daemon(daemon_paths)
+
+    async def _drive() -> tuple[control.ControlResponse, control.ControlResponse]:
+        start = await d.handle_request(control.StartRequest())
+        stop = await d.handle_request(control.StopRequest())
+        return start, stop
+
+    start, stop = asyncio.run(_drive())
+    assert start.status == "ok"
+    assert stop.status == "ok"
+    assert sessions[0].stop_calls == 1
+    assert d._state == daemon._CaptureState.IDLE
+
+
+def test_quit_request_finalizes_in_flight_capture(
+    daemon_paths: dict[str, Path],
+) -> None:
+    """quit(finalize=True) while RUNNING must stop the capture cleanly."""
+    d, sessions = _make_daemon(daemon_paths)
+
+    async def _drive() -> tuple[control.ControlResponse, control.ControlResponse]:
+        start = await d.handle_request(control.StartRequest())
+        quit_resp = await d.handle_request(
+            control.QuitRequest(finalize=True)
+        )
+        return start, quit_resp
+
+    start, quit_resp = asyncio.run(_drive())
+    assert start.status == "ok"
+    assert quit_resp.status == "ok"
+    assert sessions[0].stop_calls == 1
+    # The shutdown event must be set so serve_forever() can wind down.
+    assert d._shutdown_event.is_set()
+
+
+def test_quit_refuses_when_capture_in_progress_and_finalize_false(
+    daemon_paths: dict[str, Path],
+) -> None:
+    d, sessions = _make_daemon(daemon_paths)
+
+    async def _drive() -> tuple[control.ControlResponse, control.ControlResponse]:
+        start = await d.handle_request(control.StartRequest())
+        quit_resp = await d.handle_request(
+            control.QuitRequest(finalize=False)
+        )
+        return start, quit_resp
+
+    start, quit_resp = asyncio.run(_drive())
+    assert start.status == "ok"
+    assert quit_resp.status == "capture_in_progress"
+    # Capture must still be running and the shutdown event must NOT be set.
+    assert sessions[0].stop_calls == 0
+    assert d._state == daemon._CaptureState.RUNNING
+    assert not d._shutdown_event.is_set()
+
+
+def test_status_idle_includes_daemon_pid_and_hotkey_stub(
+    daemon_paths: dict[str, Path],
+) -> None:
+    d, _sessions = _make_daemon(daemon_paths)
+
+    async def _drive() -> control.ControlResponse:
+        return await d.handle_request(control.StatusRequest())
+
+    resp = asyncio.run(_drive())
+    assert resp.status == "ok"
+    assert resp.daemon is not None
+    assert resp.daemon.running is True
+    assert resp.daemon.pid == os.getpid()
+    assert resp.daemon.autostart_registered is False
+    assert resp.hotkey is not None
+    assert resp.hotkey.state == "unregistered"
+    assert resp.capture is not None
+    assert resp.capture.running is False
+
+
+def test_status_after_start_reports_running_capture(
+    daemon_paths: dict[str, Path],
+) -> None:
+    d, sessions = _make_daemon(daemon_paths)
+
+    async def _drive() -> control.ControlResponse:
+        await d.handle_request(control.StartRequest())
+        return await d.handle_request(control.StatusRequest())
+
+    resp = asyncio.run(_drive())
+    assert resp.status == "ok"
+    assert resp.capture is not None
+    assert resp.capture.running is True
+    # The fake session's state dict has these fields.
+    assert resp.capture.audio_path is not None
+    assert resp.capture.video_path is not None
+
+
+# ---------------------------------------------------------------------------
+# SwiftChild bounded-restart loop (spec 003 slice 4, tech spec §3 risk row 1)
+#
+# Drives the restart bookkeeping directly without spawning a real subprocess
+# — the real-process behavior is covered end-to-end by
+# ``test_end_to_end_daemon_driven_three_cycles``. These tests pin the
+# "budget" semantics in isolation so future tweaks to the limit / window
+# don't silently regress.
+# ---------------------------------------------------------------------------
+
+
+def test_swift_child_restart_budget_marks_permanent_failure(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three consecutive unexpected exits inside the window are allowed; the
+    fourth blows the budget and permanently fails the child."""
+    from record import capture
+
+    # Stub the actual respawn so we exercise only the budget bookkeeping.
+    # ``_maybe_restart_after_unexpected_exit`` calls ``_spawn`` after the
+    # budget check; we patch it to a no-op.
+    async def _noop_spawn(self: object, binary: object) -> None:
+        return None
+
+    monkeypatch.setattr(capture.SwiftChild, "_spawn", _noop_spawn)
+    monkeypatch.setattr(
+        capture, "_resolve_binary", lambda: Path("/dev/null")
+    )
+
+    child = capture.SwiftChild(
+        daemon_log_path=daemon_paths["log"], daemon=True
+    )
+
+    async def _drive() -> capture.SwiftChild:
+        # First three exits stay inside the budget.
+        for _ in range(3):
+            await child._maybe_restart_after_unexpected_exit()
+            assert not child._permanently_failed, (
+                "3 exits in the window should not blow the budget"
+            )
+
+        # Fourth exit pushes us over.
+        await child._maybe_restart_after_unexpected_exit()
+        return child
+
+    asyncio.run(_drive())
+    assert child._permanently_failed is True
+    assert child._permanent_failure_reason is not None
+    assert "giving up" in child._permanent_failure_reason
+
+
+def test_swift_child_shutdown_during_restart_marks_permanent(
+    daemon_paths: dict[str, Path],
+) -> None:
+    """Once ``shutdown()`` is called, a subsequent exit doesn't trigger a
+    respawn — the child is permanently failed instead."""
+    from record import capture
+
+    child = capture.SwiftChild(
+        daemon_log_path=daemon_paths["log"], daemon=True
+    )
+    child._shutting_down = True
+
+    async def _drive() -> None:
+        await child._maybe_restart_after_unexpected_exit()
+
+    asyncio.run(_drive())
+    assert child._permanently_failed is True
+    assert child._permanent_failure_reason == "swift child shut down"
+
+
+# ---------------------------------------------------------------------------
+# Hotkey routing tests (spec 003 slice 5)
+#
+# Drive ``Daemon._on_hotkey_event`` and ``Daemon._on_hotkey_pressed`` directly
+# against the same fake-session machinery used by the slice-2 state-machine
+# tests above. No Swift subprocess, no real Carbon call — just the asyncio
+# loop and the daemon's in-memory state translation.
+# ---------------------------------------------------------------------------
+
+
+from record import ipc  # noqa: E402 - placed here next to its test usage
+
+
+def test_hotkey_press_while_idle_starts_capture(
+    daemon_paths: dict[str, Path],
+) -> None:
+    """A hotkey press from IDLE → starts a single capture (FR 2.5)."""
+    d, sessions = _make_daemon(daemon_paths)
+
+    asyncio.run(d._on_hotkey_pressed())
+
+    assert len(sessions) == 1
+    assert sessions[0].start_calls == 1
+    assert d._state == daemon._CaptureState.RUNNING
+
+
+def test_hotkey_press_while_running_stops_capture(
+    daemon_paths: dict[str, Path],
+) -> None:
+    """A hotkey press while RUNNING → the active session is stopped."""
+    d, sessions = _make_daemon(daemon_paths)
+
+    async def _drive() -> None:
+        await d._on_hotkey_pressed()  # start
+        await d._on_hotkey_pressed()  # stop
+
+    asyncio.run(_drive())
+
+    assert len(sessions) == 1
+    assert sessions[0].start_calls == 1
+    assert sessions[0].stop_calls == 1
+    assert d._state == daemon._CaptureState.IDLE
+
+
+def test_hotkey_press_during_starting_is_dropped(
+    daemon_paths: dict[str, Path],
+) -> None:
+    """A second press while the first is mid-STARTING is dropped (FR 2.5).
+
+    The first session uses a small ``start_delay`` so the second press sees
+    the daemon in ``STARTING`` and the snapshot-then-branch path takes the
+    drop branch. Only one session should be constructed in total.
+    """
+    slow = _FakeSession(
+        output_path=daemon_paths["root"] / "x.wav",
+        start_delay=0.1,
+    )
+    fast = _FakeSession(output_path=daemon_paths["root"] / "y.wav")
+    d, sessions = _make_daemon(daemon_paths, sessions=[slow, fast])
+
+    async def _drive() -> None:
+        task1 = asyncio.create_task(d._on_hotkey_pressed())
+        # Yield once so task1 enters _on_hotkey_pressed, snapshots IDLE,
+        # then dispatches _handle_start which transitions us to STARTING
+        # before task2 reads the state.
+        await asyncio.sleep(0)
+        task2 = asyncio.create_task(d._on_hotkey_pressed())
+        await asyncio.gather(task1, task2)
+
+    asyncio.run(_drive())
+
+    # Only one session was constructed; the second press never reached the
+    # factory because it was dropped during STARTING.
+    assert len(sessions) == 1
+    assert sessions[0].start_calls == 1
+
+
+def test_hotkey_registered_event_updates_status(
+    daemon_paths: dict[str, Path],
+) -> None:
+    """A successful ``hotkey_registered`` event surfaces in the status payload."""
+    d, _sessions = _make_daemon(daemon_paths)
+
+    d._on_hotkey_event(
+        ipc.HotkeyRegisteredEvent(
+            status="registered",
+            modifiers=["cmd", "option"],
+            key="r",
+            message="ok",
+        )
+    )
+
+    async def _drive() -> control.ControlResponse:
+        return await d.handle_request(control.StatusRequest())
+
+    resp = asyncio.run(_drive())
+    assert resp.hotkey is not None
+    assert resp.hotkey.state == "registered"
+    assert resp.hotkey.configured == "cmd+option+r"
+
+
+def test_hotkey_conflict_event_updates_status(
+    daemon_paths: dict[str, Path],
+) -> None:
+    """``status=conflict`` maps to a ``conflict`` HotkeyInfo carrying FR 2.13 wording."""
+    d, _sessions = _make_daemon(daemon_paths)
+
+    d._on_hotkey_event(
+        ipc.HotkeyRegisteredEvent(
+            status="conflict",
+            modifiers=["cmd", "option"],
+            key="r",
+            message="conflict",
+        )
+    )
+
+    async def _drive() -> control.ControlResponse:
+        return await d.handle_request(control.StatusRequest())
+
+    resp = asyncio.run(_drive())
+    assert resp.hotkey is not None
+    assert resp.hotkey.state == "conflict"
+    assert resp.hotkey.message is not None
+    assert (
+        "another application has registered the same combination"
+        in resp.hotkey.message
+    )
+
+
+def test_hotkey_invalid_accessibility_denied_maps_to_disabled_no_permission(
+    daemon_paths: dict[str, Path],
+) -> None:
+    """``status=invalid`` with ``message=accessibility_denied`` → ``disabled_no_permission``."""
+    d, _sessions = _make_daemon(daemon_paths)
+
+    d._on_hotkey_event(
+        ipc.HotkeyRegisteredEvent(
+            status="invalid",
+            modifiers=["cmd", "option"],
+            key="r",
+            message="accessibility_denied",
+        )
+    )
+
+    assert d._hotkey_state.state == "disabled_no_permission"
+    assert d._hotkey_state.message is not None
+    assert "Accessibility permission missing" in d._hotkey_state.message
+
+
+def test_hotkey_invalid_other_message_maps_to_invalid(
+    daemon_paths: dict[str, Path],
+) -> None:
+    """``status=invalid`` with any non-accessibility message → ``invalid``."""
+    d, _sessions = _make_daemon(daemon_paths)
+
+    d._on_hotkey_event(
+        ipc.HotkeyRegisteredEvent(
+            status="invalid",
+            modifiers=["cmd", "option"],
+            key="r",
+            message="param_err",
+        )
+    )
+
+    assert d._hotkey_state.state == "invalid"
+    assert d._hotkey_state.message == "param_err"
+
+
+def test_hotkey_unregistered_event_resets_state(
+    daemon_paths: dict[str, Path],
+) -> None:
+    """A ``hotkey_unregistered`` event clears the configured combo back to default."""
+    d, _sessions = _make_daemon(daemon_paths)
+
+    # First register, then unregister.
+    d._on_hotkey_event(
+        ipc.HotkeyRegisteredEvent(
+            status="registered",
+            modifiers=["cmd", "option"],
+            key="r",
+            message="ok",
+        )
+    )
+    assert d._hotkey_state.state == "registered"
+
+    d._on_hotkey_event(ipc.HotkeyUnregisteredEvent())
+
+    assert d._hotkey_state.state == "unregistered"
+    assert d._hotkey_state.configured is None
+
+
+# ---------------------------------------------------------------------------
+# Feedback wiring (spec 003 slice 6)
+#
+# Patch ``record.daemon.feedback`` with a recording stub and assert the
+# daemon's state-machine transitions invoke ``play_start`` / ``play_stop`` /
+# ``play_error`` / ``notify`` at the right moments and respect
+# ``Config.audible_feedback``.
+# ---------------------------------------------------------------------------
+
+
+from record.config import Config  # noqa: E402 - placed near its test usage
+
+
+def _make_config(*, audible_feedback: bool, tmp_path: Path) -> Config:
+    """Build a sandbox-safe :class:`Config` for daemon tests.
+
+    Path defaults under :class:`Config` point at ``~/record/*`` and run a
+    collision check; tests inject ``tmp_path``-rooted directories so we don't
+    touch the developer's real ``~/record/`` and so the collision check is
+    happy.
+    """
+    return Config(
+        hotkey="option+command+r",
+        output_folder=str(tmp_path / "out"),
+        log_folder=str(tmp_path / "logs"),
+        audible_feedback=audible_feedback,
+    )
+
+
+def test_hotkey_press_start_plays_tink_by_default(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """IDLE→RUNNING via hotkey press → ``play_start(enabled=True)`` fires once."""
+    stub = _install_feedback_stub(monkeypatch)
+    d, _sessions = _make_daemon(daemon_paths)
+
+    asyncio.run(d._on_hotkey_pressed())
+
+    assert stub.start_calls == [True]
+    assert stub.stop_calls == []
+    assert stub.error_calls == []
+    assert stub.notify_calls == []
+
+
+def test_hotkey_press_stop_plays_pop(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUNNING→IDLE via hotkey press → ``play_stop(enabled=True)`` fires once."""
+    stub = _install_feedback_stub(monkeypatch)
+    d, _sessions = _make_daemon(daemon_paths)
+
+    async def _drive() -> None:
+        await d._on_hotkey_pressed()  # start
+        await d._on_hotkey_pressed()  # stop
+
+    asyncio.run(_drive())
+
+    assert stub.start_calls == [True]
+    assert stub.stop_calls == [True]
+    assert stub.error_calls == []
+
+
+def test_hotkey_press_during_transition_plays_error_and_notifies(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second press while the first is mid-STARTING → Funk + banner.
+
+    Mirrors the existing ``test_hotkey_press_during_starting_is_dropped`` race
+    setup but asserts the feedback surface fires once for the dropped press.
+    """
+    stub = _install_feedback_stub(monkeypatch)
+    slow = _FakeSession(
+        output_path=daemon_paths["root"] / "x.wav",
+        start_delay=0.1,
+    )
+    fast = _FakeSession(output_path=daemon_paths["root"] / "y.wav")
+    d, _sessions = _make_daemon(daemon_paths, sessions=[slow, fast])
+
+    async def _drive() -> None:
+        task1 = asyncio.create_task(d._on_hotkey_pressed())
+        await asyncio.sleep(0)  # let task1 transition IDLE → STARTING
+        task2 = asyncio.create_task(d._on_hotkey_pressed())
+        await asyncio.gather(task1, task2)
+
+    asyncio.run(_drive())
+
+    # task1 completed successfully → exactly one start sound.
+    assert stub.start_calls == [True]
+    # task2 was dropped during STARTING → exactly one error sound + banner.
+    assert stub.error_calls == [True]
+    assert len(stub.notify_calls) == 1
+    assert "transition" in stub.notify_calls[0]
+
+
+def test_audible_feedback_off_silences_start_and_stop_sounds(
+    daemon_paths: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``Config.audible_feedback=False`` → sounds called with ``enabled=False``.
+
+    Per FR 2.9 the daemon still invokes ``play_*`` — the gating happens inside
+    :mod:`record.feedback` (no-op when ``enabled=False``). We assert the
+    daemon plumbed the flag through correctly rather than skipped the call.
+    """
+    stub = _install_feedback_stub(monkeypatch)
+    cfg = _make_config(audible_feedback=False, tmp_path=tmp_path)
+    d, _sessions = _make_daemon(daemon_paths, config=cfg)
+
+    async def _drive() -> None:
+        await d._on_hotkey_pressed()  # start
+        await d._on_hotkey_pressed()  # stop
+
+    asyncio.run(_drive())
+
+    # The daemon DID call play_start / play_stop — but with enabled=False so
+    # ``feedback`` will no-op. Asserting the calls rather than their absence
+    # is the contract: the audible-feedback toggle is feedback-module-side.
+    assert stub.start_calls == [False]
+    assert stub.stop_calls == [False]
+    assert stub.error_calls == []
+
+
+def test_socket_driven_start_ok_plays_start_not_error(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful ``record start`` over the socket → Tink, never Funk.
+
+    The error-sound + banner branch is hotkey-specific (FR 2.8 third bullet
+    wording). Socket-driven starts that succeed take the unconditional
+    happy-path Tink (FR 2.8 first bullet).
+    """
+    stub = _install_feedback_stub(monkeypatch)
+    d, _sessions = _make_daemon(daemon_paths)
+
+    async def _drive() -> control.ControlResponse:
+        return await d.handle_request(control.StartRequest())
+
+    resp = asyncio.run(_drive())
+
+    assert resp.status == "ok"
+    assert stub.start_calls == [True]
+    assert stub.error_calls == []
+    assert stub.notify_calls == []
+
+
+def test_accessibility_denied_event_notifies_without_sound(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``hotkey_registered: invalid/accessibility_denied`` → banner, no sound.
+
+    Tech spec §2.9: daemon-level warnings the user must know about (the
+    canonical example being Accessibility denied) use the banner. There is no
+    error sound here — the daemon is in startup, not in a hotkey-press error
+    path.
+    """
+    stub = _install_feedback_stub(monkeypatch)
+    d, _sessions = _make_daemon(daemon_paths)
+
+    d._on_hotkey_event(
+        ipc.HotkeyRegisteredEvent(
+            status="invalid",
+            modifiers=["cmd", "option"],
+            key="r",
+            message="accessibility_denied",
+        )
+    )
+
+    assert len(stub.notify_calls) == 1
+    assert "Accessibility permission denied" in stub.notify_calls[0]
+    assert stub.start_calls == []
+    assert stub.stop_calls == []
+    assert stub.error_calls == []
+
+
+def test_hotkey_press_with_failing_start_plays_error_and_notifies(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hotkey press whose ``_handle_start`` errors → Funk + banner naming the cause."""
+    from record.capture import CaptureFailedToStart
+
+    stub = _install_feedback_stub(monkeypatch)
+    failing = _FakeSession(
+        output_path=daemon_paths["root"] / "x.wav",
+        start_raises=CaptureFailedToStart("mic permission denied"),
+    )
+    d, _sessions = _make_daemon(daemon_paths, sessions=[failing])
+
+    asyncio.run(d._on_hotkey_pressed())
+
+    # play_start is on the OK-return path; a failed start never reaches it.
+    assert stub.start_calls == []
+    assert stub.error_calls == [True]
+    assert len(stub.notify_calls) == 1
+    # The banner echoes the underlying detail so the user can act on it.
+    assert "mic permission denied" in stub.notify_calls[0]

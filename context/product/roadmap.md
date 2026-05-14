@@ -15,8 +15,7 @@ _The MVP — reliable manual capture that the consultant persona can adopt for d
   - [ ] **Local folder output with predictable naming:** Write video and audio to a user-configured local folder using a stable naming convention (timestamp-based) so artifacts are easy to find without an in-app library.
 
 - [ ] **Transcript Pipeline V1 (Cloud)**
-  - [ ] **Cloud-based transcription with speaker diarization:** After the call ends, send the audio to a cloud transcription provider that returns text segmented by speaker.
-  - [ ] **Speaker-attributed transcript file:** Write the diarized transcript with timestamps to the same local folder alongside the audio and video, in a structured format (e.g., `.json` plus a human-readable `.txt` or `.srt`).
+  - [ ] **Speaker-attributed transcript file (cloud):** After the call ends, send the audio to a cloud transcription provider with speaker diarization and write the resulting transcript — with timestamps and speaker labels — to the same local folder alongside the audio and video.
 
 ---
 

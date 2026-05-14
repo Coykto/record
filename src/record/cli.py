@@ -1,10 +1,19 @@
 """Typer CLI for the record orchestrator.
 
-Exposes ``record start`` and ``record stop`` per
-``context/spec/001-mixed-mic-system-audio-capture/technical-considerations.md``
-§2.4. Both commands return promptly: ``start`` spawns a detached supervisor
-and exits, ``stop`` signals the supervisor and waits for it to exit (with a
-timeout) before printing a final summary.
+Spec 003 slice 2 dissolves the legacy ``record start`` / ``record stop`` →
+``python -m record.supervisor`` spawn into a thin **client** of the running
+daemon's Unix-domain control socket:
+
+- ``record start`` sends a ``{"op":"start"}`` request.
+- ``record stop`` sends a ``{"op":"stop"}`` request, then re-renders the same
+  human-readable summary as the legacy stop (driven off the daemon-finalized
+  ``capture-state.json``).
+- ``record status`` sends a ``{"op":"status"}`` request and prints a short
+  block per FR 2.4.
+
+When the daemon isn't reachable the CLI prints the FR 2.7 "daemon is not
+running" message and exits non-zero. The legacy ``python -m record.supervisor``
+entry-point remains intact for the integration suite and offline use.
 """
 
 from __future__ import annotations
@@ -15,52 +24,36 @@ import subprocess
 import sys
 import time
 from datetime import datetime
-from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Any
 
 import typer
 
-from . import paths, state
+from . import config as config_module
+from . import control, launchagent, paths, state
 
 app = typer.Typer(help="record: privacy-first meeting recorder")
 
-# `record daemon ...` sub-app — spec 003 slice 1. The daemon is a long-running
-# background process owning the hotkey/capture lifecycle in later slices; in
-# slice 1 it merely claims a PID file, idles on an asyncio.Event, and exits on
-# SIGTERM. The legacy `record start` / `record stop` commands are untouched.
+# `record daemon ...` sub-app — spec 003 slice 1 + 2 commands.
 daemon_app = typer.Typer(help="Control the background record daemon.")
 app.add_typer(daemon_app, name="daemon")
 
-# How long `record stop` waits for the supervisor to exit after SIGTERM.
+# How long `record daemon stop` (and legacy `record stop` paths still in tests)
+# wait for a process to exit after SIGTERM.
 _STOP_TIMEOUT_SECONDS = 10.0
 _STOP_POLL_INTERVAL = 0.1
 
-# Brief synchronous handshake after `record start` spawns the supervisor: we
-# poll for early supervisor exit (binary missing, permission denied) so we can
-# surface the right exit code instead of returning 0 and leaving a stale PID.
-_START_HANDSHAKE_SECONDS = 3.0
-_START_HANDSHAKE_INTERVAL = 0.1
-
-# Same idea for the daemon scaffold spawned by `record daemon start`. Kept as
-# distinct constants so tuning one doesn't move the supervisor's window.
+# Daemon-spawn handshake window (slice 1).
 _DAEMON_START_HANDSHAKE_SECONDS = 3.0
 _DAEMON_START_POLL_INTERVAL = 0.05
 
-# Audio capture format. The Swift binary writes a WAV at exactly these
-# parameters; downstream transcription (Deepgram nova-3) is tuned for
-# 16 kHz / 16-bit / mono so we pin them here rather than exposing them as
-# user flags. The supervisor's argparse defaults match these values as a
-# backstop, but the CLI is the authoritative source.
+# Audio capture format. Pinned to the Deepgram nova-3 target; kept here as a
+# historical anchor — the daemon owns the negotiation in slice 2.
 _SAMPLE_RATE = 16000
 _BIT_DEPTH = 16
 _CHANNELS = 1
 
 # Lookup: permission_denied kind -> human-readable description for the user.
-# Modern macOS labels the screen-recording panel "Screen & System Audio
-# Recording"; on macOS 13 it's still "Screen Recording" — we go with the
-# current label since the project targets macOS 13+ but most users will be on
-# 14+.
 _PERMISSION_MESSAGES: dict[str, str] = {
     "microphone": (
         "microphone permission denied — grant access in "
@@ -72,6 +65,67 @@ _PERMISSION_MESSAGES: dict[str, str] = {
     ),
 }
 
+# FR 2.7 third bullet — surfaced anywhere a CLI socket request fails because
+# the daemon isn't running.
+_DAEMON_NOT_RUNNING_MESSAGE = (
+    "daemon is not running — try `record daemon start` or `record install`"
+)
+
+
+# ---------------------------------------------------------------------------
+# Hotkey rendering helpers (spec 003 slice 5 — `record status`)
+# ---------------------------------------------------------------------------
+
+# macOS menu-style glyphs for each modifier. Drives the visual rendering of
+# ``record status`` so the user sees the same combo macOS itself would print.
+_HOTKEY_GLYPHS: dict[str, str] = {
+    "cmd": "⌘",
+    "option": "⌥",
+    "control": "⌃",
+    "shift": "⇧",
+}
+# Display order matches macOS menu rendering convention (control, option,
+# shift, command — left-to-right on a menu shortcut).
+_HOTKEY_GLYPH_ORDER: tuple[str, ...] = ("control", "option", "shift", "cmd")
+# Named-key display overrides. Keys not in this dict use ``upper()`` for
+# single letters / function keys, otherwise the raw canonical name.
+_NAMED_KEY_DISPLAY: dict[str, str] = {
+    "space": "Space",
+    "tab": "Tab",
+    "return": "Return",
+    "escape": "Escape",
+    "delete": "Delete",
+}
+
+
+def _format_hotkey_glyphs(configured: str | None) -> str:
+    """Render a canonical hotkey string in macOS glyph form.
+
+    ``"cmd+option+r"`` → ``"⌥⌘R"``. Returns ``"(unknown)"`` when
+    ``configured`` is ``None`` or the string can't be parsed. The renderer is
+    intentionally tolerant — a malformed config-time hotkey string shouldn't
+    take down ``record status``.
+    """
+    if not configured:
+        return "(unknown)"
+    parts = configured.split("+")
+    if not parts:
+        return "(unknown)"
+    *mods, key = parts
+    mods_set = set(mods)
+    ordered_glyphs = "".join(
+        _HOTKEY_GLYPHS[m] for m in _HOTKEY_GLYPH_ORDER if m in mods_set
+    )
+    if key in _NAMED_KEY_DISPLAY:
+        key_display = _NAMED_KEY_DISPLAY[key]
+    elif len(key) == 1:
+        key_display = key.upper()
+    elif key.startswith("f") and key[1:].isdigit():
+        key_display = key.upper()
+    else:
+        key_display = key
+    return ordered_glyphs + key_display
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -79,21 +133,12 @@ _PERMISSION_MESSAGES: dict[str, str] = {
 
 
 def _filename_timestamp(now: datetime | None = None) -> str:
-    """Return a filename-safe timestamp like ``2026-05-10T14-32-08``.
-
-    Local time is used because the on-disk file lives next to the user's
-    other meeting artifacts, where wall-clock-local is the natural sort key.
-    """
+    """Return a filename-safe timestamp like ``2026-05-10T14-32-08``."""
     moment = now if now is not None else datetime.now()
     return moment.strftime("%Y-%m-%dT%H-%M-%S")
 
 
 def _format_duration(seconds: float | None) -> str:
-    """Format a duration for the stop-summary line.
-
-    Sub-minute durations get one decimal of seconds (``3.2 s``); minute-plus
-    durations switch to ``Mm SSs`` for readability.
-    """
     if seconds is None:
         return "unknown"
     if seconds < 60:
@@ -103,7 +148,6 @@ def _format_duration(seconds: float | None) -> str:
 
 
 def _format_offset(seconds: float | None) -> str:
-    """Format an at-offset-seconds value as ``MM:SS``."""
     if seconds is None:
         return "??:??"
     total = int(round(seconds))
@@ -112,30 +156,13 @@ def _format_offset(seconds: float | None) -> str:
 
 
 def _summarize_video(state_dict: dict[str, Any]) -> str:
-    """Build the human-friendly video-source line for the stop summary.
-
-    Returns one of:
-      - ``"video: never_attached"`` — no ``video_started`` event was observed
-        (e.g. audio-only run, or video failed before producing a single frame).
-      - ``"video: <path> (<duration>, <width>×<height>)"`` — the video stream
-        attached and produced an mp4. The duration comes from the ``video_file``
-        event (preferred) and falls back to the audio duration / ``unknown`` if
-        the event hasn't landed (defensive — a clean stop always emits one).
-      - ``"video: unavailable — <reason>"`` — the video stream never produced a
-        frame (``at_offset_seconds == 0``); typically permission denial. No mp4
-        on disk.
-      - ``"video: <path> — stopped at MM:SS, reason <reason>"`` — the video
-        stream errored out mid-capture; audio was unaffected and the partial
-        mp4 is playable up to the failure point.
-    """
+    """Build the human-friendly video-source line for the stop summary."""
     sources = state_dict.get("sources") or {}
     video = sources.get("video") or {}
     status = video.get("status", "never_attached")
 
     if status == "attached":
         path = state_dict.get("video_output_path") or "(unknown)"
-        # Prefer the binary's reported video duration; fall back to the audio
-        # capture duration if the video_file event hasn't been processed.
         duration_seconds = state_dict.get("video_file_duration_seconds")
         if duration_seconds is None:
             duration_seconds = state_dict.get("duration_seconds")
@@ -146,16 +173,12 @@ def _summarize_video(state_dict: dict[str, Any]) -> str:
         return f"video: {path} ({duration}, {dims})"
 
     if status == "lost":
-        # Find the single video warning (supervisor idempotency guarantees at
-        # most one). Read offset + reason; discriminate offset-0 (never started)
-        # from a mid-capture failure.
         video_warning: dict[str, Any] | None = None
         for w in state_dict.get("warnings", []) or []:
             if isinstance(w, dict) and w.get("source") == "video":
                 video_warning = w
                 break
         if video_warning is None:
-            # Defensive fallback — shouldn't happen in practice.
             path = state_dict.get("video_output_path") or "(unknown)"
             return f"video: {path} (lost)"
         reason = video_warning.get("message") or "unknown"
@@ -177,7 +200,6 @@ def _summarize_sources(state_dict: dict[str, Any]) -> str:
     mic_status = mic.get("status", "never_attached")
     sysa_status = sysa.get("status", "never_attached")
 
-    # Drop offsets from the warnings list so we can annotate "lost at MM:SS".
     lost_offsets: dict[str, float] = {}
     for w in state_dict.get("warnings", []) or []:
         src = w.get("source")
@@ -206,13 +228,10 @@ def _summarize_sources(state_dict: dict[str, Any]) -> str:
 
 
 def _extra_warnings(state_dict: dict[str, Any]) -> list[str]:
-    """Return non-source-loss warnings that are worth showing on stop."""
     extras: list[str] = []
-    # Note: permission_denied is handled separately by the exit-2 branch in
-    # `stop`; intentionally not included here.
     for w in state_dict.get("warnings", []) or []:
         if w.get("source") in ("mic", "system_audio", "video"):
-            continue  # already covered by the sources / video line
+            continue
         msg = w.get("message")
         if msg:
             extras.append(str(msg))
@@ -220,272 +239,24 @@ def _extra_warnings(state_dict: dict[str, Any]) -> list[str]:
 
 
 def _permission_message(kind: str) -> str:
-    """Map a permission_denied kind to a user-facing message."""
     return _PERMISSION_MESSAGES.get(
         kind,
         f"{kind} permission denied — grant access in System Settings → Privacy & Security",
     )
 
 
-def _resolve_capture_binary() -> Path | None:
-    """Locate the bundled `record-capture` binary.
+def _print_stop_summary(final: dict[str, Any]) -> None:
+    """Render the same summary block the legacy ``record stop`` produced.
 
-    Mirrors `supervisor._resolve_binary` so the CLI can fail fast with exit 3
-    before claiming the PID file. Returns ``None`` if missing or not
-    executable.
+    Factored out so the new socket-client ``record stop`` and the legacy
+    summary tests share one renderer.
     """
-    try:
-        resource = files("record") / "bin" / "record-capture"
-    except (ModuleNotFoundError, FileNotFoundError):
-        return None
-    try:
-        with as_file(resource) as path:
-            target = Path(path)
-            if not target.exists() or not os.access(target, os.X_OK):
-                return None
-            return target
-    except (FileNotFoundError, ModuleNotFoundError):
-        return None
-
-
-def _wait_for_early_failure(
-    proc: subprocess.Popen[Any], timeout: float
-) -> bool:
-    """Poll up to ``timeout`` seconds for the supervisor to either fail fast
-    or signal healthy startup.
-
-    Returns ``True`` if the supervisor exited within the window (a failure
-    signal for `record start`), ``False`` if it appears healthy.
-
-    Healthy is detected either by the deadline elapsing without an exit, OR
-    by ``capture-state.json`` reporting a ``start_time`` (set when the Swift
-    binary emits the ``started`` event). The latter lets the common happy
-    path return well under a second instead of always waiting the full
-    timeout.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            return True
-        snapshot = state.read_state() or {}
-        if snapshot.get("start_time"):
-            return False
-        time.sleep(_START_HANDSHAKE_INTERVAL)
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
-
-
-@app.command()
-def start() -> None:
-    """Start a recording session.
-
-    Resolves an absolute output path, spawns a detached supervisor process,
-    and returns immediately. The supervisor owns the Swift capture binary
-    for the rest of the capture lifetime.
-    """
-    paths.ensure_dirs()
-
-    # Single-instance check: refuse if a live supervisor is already running.
-    existing_pid = state.read_pid_file()
-    if existing_pid is not None:
-        if state.is_alive(existing_pid):
-            typer.echo(
-                f"capture already in progress (PID {existing_pid})", err=True
-            )
-            raise typer.Exit(code=1)
-        # Stale PID file — clean it up so claim_pid_file below succeeds.
-        state.remove_pid_file()
-        # Don't leave a half-written state file pointing at a dead PID either.
-        state.remove_state()
-
-    # Pre-check the bundled Swift binary before claiming the PID file so a
-    # missing binary doesn't leave half-set-up artifacts on disk.
-    binary = _resolve_capture_binary()
-    if binary is None:
-        # Best-effort: surface the path we expected so the user can see what's
-        # missing. If the resource can't be resolved at all, fall back to a
-        # generic message.
-        try:
-            resource = files("record") / "bin" / "record-capture"
-            with as_file(resource) as path:
-                expected = str(Path(path))
-        except Exception:
-            expected = "src/record/bin/record-capture"
-        typer.echo(
-            f"capture binary not found at {expected} — "
-            f"run `make install` to build and install it",
-            err=True,
-        )
-        raise typer.Exit(code=3)
-
-    # Resolve the absolute output paths before forking so the supervisor sees
-    # fully qualified paths even if its CWD differs from ours. Both the .wav
-    # and the .mp4 share a single timestamp stem — compute the stem once and
-    # reuse it so the pair is always co-named on disk.
-    stem = _filename_timestamp()
-    output_path = (Path.cwd() / f"{stem}.wav").resolve()
-    video_output_path = (Path.cwd() / f"{stem}.mp4").resolve()
-
-    # Spawn the supervisor fully detached from this terminal. Format params
-    # are passed explicitly so the CLI owns the capture-format decision; the
-    # supervisor forwards them verbatim into the `start` IPC command.
-    try:
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "record.supervisor",
-                "--output-path",
-                str(output_path),
-                "--video-output-path",
-                str(video_output_path),
-                "--sample-rate",
-                str(_SAMPLE_RATE),
-                "--bit-depth",
-                str(_BIT_DEPTH),
-                "--channels",
-                str(_CHANNELS),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
-    except (OSError, FileNotFoundError) as exc:
-        typer.echo(
-            f"failed to launch supervisor: {exc} — "
-            f"run `make install` to (re)build the capture pipeline",
-            err=True,
-        )
-        raise typer.Exit(code=3) from None
-
-    # Record the supervisor's PID. We use claim_pid_file so a leftover stale
-    # file (e.g. from a crash since our earlier check) is still recovered.
-    try:
-        state.claim_pid_file(proc.pid)
-    except state.CaptureAlreadyRunning as exc:
-        # Lost the race against another `record start`. Tell the supervisor
-        # we just spawned to back off, then exit.
-        typer.echo(str(exc), err=True)
-        try:
-            os.kill(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        raise typer.Exit(code=1) from None
-
-    # Brief synchronous handshake: if the supervisor dies within the window we
-    # inspect the final state file and translate it into the right CLI exit
-    # code. Healthy startup returns within a tick or two of polling.
-    if _wait_for_early_failure(proc, _START_HANDSHAKE_SECONDS):
-        final = state.read_state() or {}
-        # Tidy up before exiting — the supervisor is dead, nothing else owns
-        # these files.
-        state.remove_pid_file()
-        state.remove_state()
-
-        kind = final.get("permission_denied")
-        if isinstance(kind, str):
-            typer.echo(_permission_message(kind), err=True)
-            raise typer.Exit(code=2) from None
-
-        # The supervisor leaves a "capture binary missing" warning when its
-        # own _resolve_binary returns None — match it here so a race between
-        # our pre-check and supervisor startup still surfaces correctly.
-        warnings = final.get("warnings") or []
-        for w in warnings:
-            msg = (w.get("message") or "") if isinstance(w, dict) else ""
-            if "capture binary missing" in msg.lower():
-                typer.echo(
-                    "capture binary missing or not executable — "
-                    "run `make install` to build and install it",
-                    err=True,
-                )
-                raise typer.Exit(code=3) from None
-
-        # Generic launch failure.
-        typer.echo(
-            "supervisor failed to start — "
-            "inspect ~/Library/Logs/record/daemon.log for clues",
-            err=True,
-        )
-        raise typer.Exit(code=3) from None
-
-    typer.echo(
-        f"capture started (pid {proc.pid}) -> "
-        f"audio={output_path}, video={video_output_path}"
-    )
-
-
-@app.command()
-def stop() -> None:
-    """Stop the active recording session.
-
-    Sends SIGTERM to the supervisor, waits for it to finalize state, prints
-    a summary, and cleans up the PID and state files.
-    """
-    pid = state.read_pid_file()
-    if pid is None:
-        typer.echo("no capture running", err=True)
-        raise typer.Exit(code=1)
-
-    if not state.is_alive(pid):
-        state.remove_pid_file()
-        state.remove_state()
-        typer.echo("no capture running (stale PID file cleaned up)", err=True)
-        raise typer.Exit(code=1)
-
-    # Ask the supervisor to wind things down.
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        # Race: process died between is_alive and now.
-        state.remove_pid_file()
-        state.remove_state()
-        typer.echo("no capture running (process disappeared)", err=True)
-        raise typer.Exit(code=1) from None
-
-    deadline = time.monotonic() + _STOP_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        if not state.is_alive(pid):
-            break
-        time.sleep(_STOP_POLL_INTERVAL)
-    else:
-        # Force-kill is intentionally NOT used here — leave the process for
-        # the user to inspect via daemon.log / orchestrator.log.
-        typer.echo(
-            f"supervisor (PID {pid}) did not exit within "
-            f"{_STOP_TIMEOUT_SECONDS:.0f}s — inspect "
-            f"~/Library/Logs/record/daemon.log and "
-            f"~/Library/Logs/record/orchestrator.log for clues",
-            err=True,
-        )
-        raise typer.Exit(code=4)
-
-    # Read the final state. The supervisor sets `final: True` as the last
-    # write before it exits; if we don't see it, the file is at least the
-    # latest snapshot the supervisor managed to persist.
-    final = state.read_state() or {}
-
-    # Permission denial gets its own exit code (2) and a System-Settings-aware
-    # message rather than the regular summary.
-    kind = final.get("permission_denied")
-    if isinstance(kind, str):
-        typer.echo(_permission_message(kind), err=True)
-        state.remove_pid_file()
-        state.remove_state()
-        raise typer.Exit(code=2)
-
     output_path = final.get("output_path") or "(unknown)"
     duration = _format_duration(final.get("duration_seconds"))
     sources_line = _summarize_sources(final)
     video_line = _summarize_video(final)
 
-    typer.echo(f"capture stopped")
+    typer.echo("capture stopped")
     typer.echo(f"  output:   {output_path}")
     typer.echo(f"  duration: {duration}")
     typer.echo(f"  sources:  {sources_line}")
@@ -493,39 +264,262 @@ def stop() -> None:
     for warning in _extra_warnings(final):
         typer.echo(f"  warning:  {warning}")
 
-    # Tidy up. Both removals are idempotent on missing files.
-    state.remove_pid_file()
-    state.remove_state()
+
+# ---------------------------------------------------------------------------
+# Daemon-routed commands (spec 003 slice 2)
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def start() -> None:
+    """Start a recording session via the running daemon.
+
+    Sends a ``{"op":"start"}`` request to the daemon's control socket. The
+    daemon spawns the Swift capture binary, sends a ``start`` command, and
+    replies with the resolved audio/video paths.
+
+    Exit codes:
+      * 0 — capture started.
+      * 1 — capture already in progress, or daemon not running.
+      * 2 — daemon refused with a permission-denied condition (rare on start
+            in slice 2; slice 6 fills out the audible/banner error path).
+      * 3 — daemon errored (capture failed to start, e.g. missing binary).
+    """
+    try:
+        resp = control.send_request_sync(control.StartRequest())
+    except control.DaemonUnreachable:
+        typer.echo(_DAEMON_NOT_RUNNING_MESSAGE, err=True)
+        raise typer.Exit(code=1) from None
+
+    if resp.status == "ok":
+        typer.echo(
+            f"capture started -> audio={resp.audio_path}, video={resp.video_path}"
+        )
+        return
+
+    if resp.status == "already_running":
+        typer.echo("capture already in progress", err=True)
+        raise typer.Exit(code=1)
+
+    if resp.status == "busy":
+        typer.echo(f"daemon busy: {resp.detail or 'try again shortly'}", err=True)
+        raise typer.Exit(code=1)
+
+    # "error" / anything else — surface the daemon's detail string.
+    typer.echo(
+        f"capture failed to start: {resp.detail or resp.status}",
+        err=True,
+    )
+    raise typer.Exit(code=3)
+
+
+@app.command()
+def stop() -> None:
+    """Stop the active recording session via the running daemon.
+
+    Sends a ``{"op":"stop"}`` request. The daemon finalizes
+    ``capture-state.json`` (``final: true``) before replying, so reading the
+    state file after the response gives the same summary the legacy stop
+    produced.
+
+    Exit codes mirror the legacy stop: 0 (success), 1 (not running / daemon
+    unreachable), 2 (permission denied), 4 (timeout — daemon didn't reply).
+    """
+    try:
+        resp = control.send_request_sync(control.StopRequest())
+    except control.DaemonUnreachable:
+        typer.echo(_DAEMON_NOT_RUNNING_MESSAGE, err=True)
+        raise typer.Exit(code=1) from None
+
+    if resp.status == "not_running":
+        typer.echo("no capture running", err=True)
+        raise typer.Exit(code=1)
+
+    if resp.status == "busy":
+        typer.echo(f"daemon busy: {resp.detail or 'try again shortly'}", err=True)
+        raise typer.Exit(code=1)
+
+    if resp.status not in ("ok",):
+        typer.echo(
+            f"capture failed to stop: {resp.detail or resp.status}",
+            err=True,
+        )
+        raise typer.Exit(code=4)
+
+    # Daemon finalized capture-state.json with `final: true` before replying.
+    # Re-render the same summary block the legacy stop did.
+    final = state.read_state() or {}
+
+    kind = final.get("permission_denied")
+    if isinstance(kind, str):
+        typer.echo(_permission_message(kind), err=True)
+        raise typer.Exit(code=2)
+
+    _print_stop_summary(final)
+
+
+@app.command()
+def status() -> None:
+    """Print a short, human-readable summary of the daemon and current capture.
+
+    Exit code 0 if the daemon is running, non-zero otherwise (FR 2.4 final
+    bullet — lets scripts rely on it).
+    """
+    try:
+        resp = control.send_request_sync(control.StatusRequest())
+    except control.DaemonUnreachable:
+        # Partial status: the daemon isn't reachable, but autostart-registered
+        # is still meaningful via `launchctl print` (tech spec §2.6).
+        typer.echo("daemon: not running")
+        autostart = (
+            "registered" if launchagent.is_registered() else "not registered"
+        )
+        typer.echo(f"autostart: {autostart}")
+        raise typer.Exit(code=1) from None
+
+    if resp.status != "ok" or resp.daemon is None:
+        typer.echo(
+            f"status request failed: {resp.detail or resp.status}", err=True
+        )
+        raise typer.Exit(code=1)
+
+    daemon_info = resp.daemon
+    hotkey = resp.hotkey
+    capture = resp.capture
+
+    # daemon line
+    pid_str = f"PID {daemon_info.pid}" if daemon_info.pid is not None else "PID ?"
+    since = daemon_info.started_at or "?"
+    typer.echo(f"daemon: running ({pid_str}, since {since})")
+
+    # hotkey line — slice 5 renders the configured combo as macOS glyphs
+    # alongside the state. When the daemon reports the message in conflict /
+    # invalid / disabled_no_permission, that message carries the FR 2.13
+    # wording and is echoed verbatim.
+    if hotkey is None:
+        typer.echo("hotkey: unregistered")
+    else:
+        glyphs = _format_hotkey_glyphs(hotkey.configured)
+        if hotkey.state == "registered":
+            typer.echo(f"hotkey: {glyphs} (registered)")
+        elif hotkey.state == "conflict":
+            # The daemon already constructs the FR 2.13 wording; emit it
+            # verbatim after the glyph form so the line reads
+            # "hotkey: ⌥⌘R — hotkey may be inactive — another …".
+            msg = hotkey.message or (
+                "another application has registered the same combination"
+            )
+            typer.echo(f"hotkey: {glyphs} — {msg}")
+        elif hotkey.state == "invalid":
+            msg = hotkey.message or "invalid configuration"
+            typer.echo(f"hotkey: invalid configuration — {msg}")
+        elif hotkey.state == "disabled_no_permission":
+            msg = hotkey.message or "Accessibility permission missing"
+            typer.echo(f"hotkey: disabled — {msg}")
+        else:
+            # "unregistered" or any future state — fall through to the bare
+            # state name. Matches the slice-2 contract for existing tests.
+            typer.echo(f"hotkey: {hotkey.state}")
+
+    # autostart line — slice 2 stubs this as False.
+    autostart = "registered" if daemon_info.autostart_registered else "not registered"
+    typer.echo(f"autostart: {autostart}")
+
+    # capture line
+    if capture is not None and capture.running:
+        bits = []
+        if capture.started_at:
+            bits.append(f"since {capture.started_at}")
+        if capture.audio_path:
+            bits.append(f"audio={capture.audio_path}")
+        if capture.video_path:
+            bits.append(f"video={capture.video_path}")
+        detail = ", ".join(bits) if bits else ""
+        typer.echo(
+            "capture: running" + (f" ({detail})" if detail else "")
+        )
+    else:
+        typer.echo("capture: idle")
 
 
 # ---------------------------------------------------------------------------
-# `record daemon ...` — spec 003 slice 1
+# `record install` / `record uninstall` — spec 003 slice 7
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def install() -> None:
+    """Register the daemon as a LaunchAgent and start it.
+
+    Writes ``~/Library/LaunchAgents/com.record.daemon.plist`` and bootstraps it
+    into the per-user launchd domain (``launchctl bootstrap gui/$UID``). Re-runs
+    safely: if the agent is already loaded, the bootstrap is preceded by a
+    bootout so plist edits get picked up.
+    """
+    try:
+        cfg = config_module.load_config()
+    except config_module.ConfigError as exc:
+        typer.echo(f"config error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+
+    # The plist names StandardOutPath/StandardErrorPath under log_folder; ensure
+    # the directory exists so launchd doesn't fail-fast on its own log writes.
+    try:
+        paths.ensure_dirs_from_config(cfg)
+    except config_module.ConfigError as exc:
+        typer.echo(f"config error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+
+    result = launchagent.install(cfg)
+    if not result.success:
+        if result.launchctl_stderr:
+            typer.echo(result.launchctl_stderr, err=True)
+        typer.echo(f"install failed: {result.message}", err=True)
+        raise typer.Exit(code=3)
+
+    pid_str = f"PID {result.pid}" if result.pid is not None else "PID ?"
+    verb = "re-registered" if result.re_registered else "registered"
+    typer.echo(f"{verb} to start on login; running now ({pid_str})")
+
+
+@app.command()
+def uninstall() -> None:
+    """Bootout the LaunchAgent and remove its plist.
+
+    Idempotent — running with no agent registered exits 0.
+    """
+    result = launchagent.uninstall()
+    if not result.success:
+        if result.launchctl_stderr:
+            typer.echo(result.launchctl_stderr, err=True)
+        typer.echo(f"uninstall failed: {result.message}", err=True)
+        raise typer.Exit(code=3)
+
+    if result.already_unregistered:
+        typer.echo("already not registered")
+    else:
+        typer.echo("removed from login items; daemon stopped")
+
+
+# ---------------------------------------------------------------------------
+# `record daemon ...` — spec 003 slice 1 + 2
 # ---------------------------------------------------------------------------
 
 
 def _daemon_start_impl() -> int:
     """Spawn the daemon detached; wait briefly for the PID file to appear.
 
-    Returns the would-be CLI exit code. ``record daemon start`` raises
-    :class:`typer.Exit` on a non-zero return; ``record daemon restart`` calls
-    this directly so it can chain without re-entering Typer.
+    Returns the would-be CLI exit code. Unchanged from slice 1.
     """
     daemon_pid_path = paths.daemon_pid_file()
 
-    # Already-running check (FR 2.3 first bullet). Mirrors the supervisor
-    # singleton logic in `start()` above but against the daemon PID file.
     existing_pid = state.read_pid_file(path=daemon_pid_path)
     if existing_pid is not None:
         if state.is_alive(existing_pid):
             typer.echo(f"daemon already running (PID {existing_pid})")
             return 0
-        # Stale PID file from a crashed daemon — clear it so the spawn below
-        # can claim a fresh one.
         state.remove_pid_file(path=daemon_pid_path)
 
-    # Spawn detached, same Popen pattern the supervisor uses. The daemon
-    # itself materialises its log directory on startup; we do not need to
-    # pre-create it here.
     try:
         proc = subprocess.Popen(
             [sys.executable, "-m", "record.daemon"],
@@ -539,13 +533,9 @@ def _daemon_start_impl() -> int:
         typer.echo(f"failed to launch daemon: {exc}", err=True)
         return 3
 
-    # Handshake: poll up to _DAEMON_START_HANDSHAKE_SECONDS for the PID file
-    # to appear (success) or the process to exit (failure). The daemon writes
-    # its PID file before it begins idling on the shutdown event.
     deadline = time.monotonic() + _DAEMON_START_HANDSHAKE_SECONDS
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            # Daemon exited before we saw the PID file.
             log_hint = paths.daemon_log_file()
             typer.echo(
                 f"daemon failed to start (exit code {proc.returncode}); "
@@ -553,17 +543,11 @@ def _daemon_start_impl() -> int:
                 err=True,
             )
             return 3
-        # Read directly against the explicit path so we don't depend on the
-        # `state` module's default-path bindings (which point at capture.pid).
         if state.read_pid_file(path=daemon_pid_path) is not None:
             typer.echo(f"daemon started (PID {proc.pid})")
             return 0
         time.sleep(_DAEMON_START_POLL_INTERVAL)
 
-    # Window elapsed without the daemon writing its PID file *or* exiting.
-    # Treat as a soft success: the daemon may simply be slow on first launch.
-    # We surface a warning to stderr but still exit 0 — the user can re-check
-    # with `record status` once that lands in slice 2.
     typer.echo(
         f"daemon spawned (PID {proc.pid}) but PID file did not appear within "
         f"{_DAEMON_START_HANDSHAKE_SECONDS:.0f}s — check {paths.daemon_log_file()}",
@@ -573,10 +557,14 @@ def _daemon_start_impl() -> int:
 
 
 def _daemon_stop_impl() -> int:
-    """Send SIGTERM to the daemon and wait for it to exit.
+    """Send SIGTERM to the daemon and wait for it to exit. Unchanged from slice 1.
 
-    Returns the would-be CLI exit code. The daemon removes its own PID file
-    in its cleanup path; this function does not race that.
+    Note: slice 2's tech spec §2.11 describes ``record daemon stop`` as routed
+    through the control socket's ``quit`` request. We keep the SIGTERM path
+    for now because the daemon's SIGTERM handler runs the same graceful
+    shutdown (it sets the shutdown event, which finalizes any in-flight
+    capture in :meth:`Daemon.serve_forever`). Slice 4/5 may switch to the
+    socket path once the long-lived Swift child arrives.
     """
     daemon_pid_path = paths.daemon_pid_file()
     pid = state.read_pid_file(path=daemon_pid_path)
@@ -634,8 +622,6 @@ def daemon_stop() -> None:
 def daemon_restart() -> None:
     """Stop the daemon (if running) and start a fresh one."""
     stop_code = _daemon_stop_impl()
-    # `not running` (code 1) is fine for restart — it's also a way to start a
-    # freshly-installed daemon. Anything else (e.g. timeout=4) is fatal.
     if stop_code not in (0, 1):
         raise typer.Exit(code=stop_code)
     start_code = _daemon_start_impl()

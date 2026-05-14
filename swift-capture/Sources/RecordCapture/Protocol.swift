@@ -30,6 +30,29 @@ struct VideoConfig: Codable, Equatable {
     }
 }
 
+// MARK: - Hotkey (shared between commands and events)
+
+/// Canonical modifier name carried inside `register_hotkey` commands and
+/// `hotkey_registered` events. Mirrors the Python `Modifier` literal in
+/// `src/record/hotkey.py` — the closed set the orchestrator and the daemon
+/// agree on.
+enum HotkeyModifier: String, Codable, Equatable {
+    case cmd
+    case option
+    case control
+    case shift
+}
+
+/// Closed enum carried by `hotkey_registered`. `invalid` is a catch-all
+/// outcome whose textual `message` disambiguates the sub-case
+/// (`accessibility_denied`, `param_err`, `no_modifiers`,
+/// `unknown_key:<key>`, `unknown_osstatus_<code>`).
+enum HotkeyRegistrationStatus: String, Codable, Equatable {
+    case registered
+    case conflict
+    case invalid
+}
+
 // MARK: - Commands (orchestrator → daemon)
 
 /// A command read off stdin from the orchestrator.
@@ -40,6 +63,14 @@ enum Command: Equatable {
     case start(outputPath: String, videoOutputPath: String?, format: AudioFormat, video: VideoConfig?)
     case stop
     case shutdown
+    /// Register a global hot key. `modifiers` must be a non-empty subset
+    /// of `HotkeyModifier`; `key` must match the closed grammar in
+    /// `HotkeyMonitor.keyCode(for:)`. The daemon replies with a
+    /// `hotkey_registered` event carrying the outcome.
+    case registerHotkey(modifiers: [HotkeyModifier], key: String)
+    /// Drop any active global hot key. The daemon replies with a
+    /// `hotkey_unregistered` event.
+    case unregisterHotkey
 
     private enum CodingKeys: String, CodingKey {
         case cmd
@@ -47,12 +78,16 @@ enum Command: Equatable {
         case videoOutputPath = "video_output_path"
         case format
         case video
+        case modifiers
+        case key
     }
 
     private enum CommandKind: String, Decodable {
         case start
         case stop
         case shutdown
+        case registerHotkey = "register_hotkey"
+        case unregisterHotkey = "unregister_hotkey"
     }
 }
 
@@ -73,6 +108,12 @@ extension Command: Codable {
             self = .stop
         case .shutdown:
             self = .shutdown
+        case .registerHotkey:
+            let mods = try container.decode([HotkeyModifier].self, forKey: .modifiers)
+            let key = try container.decode(String.self, forKey: .key)
+            self = .registerHotkey(modifiers: mods, key: key)
+        case .unregisterHotkey:
+            self = .unregisterHotkey
         }
     }
 
@@ -89,6 +130,12 @@ extension Command: Codable {
             try container.encode("stop", forKey: .cmd)
         case .shutdown:
             try container.encode("shutdown", forKey: .cmd)
+        case .registerHotkey(let mods, let key):
+            try container.encode("register_hotkey", forKey: .cmd)
+            try container.encode(mods, forKey: .modifiers)
+            try container.encode(key, forKey: .key)
+        case .unregisterHotkey:
+            try container.encode("unregister_hotkey", forKey: .cmd)
         }
     }
 }
@@ -138,6 +185,17 @@ enum Event: Equatable {
     case videoFile(path: String, durationSeconds: Double)
     case displayReconfigured(reason: DisplayReconfigurationReason, newDisplayId: Int, newWidthPx: Int, newHeightPx: Int)
     case captureEndedBySystemEvent(reason: SystemEventReason, atOffsetSeconds: Double)
+    /// Outcome of a `register_hotkey` command. `message` is always present
+    /// (human-readable / machine-parseable token; see
+    /// `HotkeyMonitor.RegistrationResult`) so the orchestrator can
+    /// disambiguate sub-cases of `invalid`.
+    case hotkeyRegistered(status: HotkeyRegistrationStatus, modifiers: [HotkeyModifier], key: String, message: String)
+    /// Fires every time the registered global hot key is pressed. The
+    /// daemon guarantees this never arrives before `hotkey_registered`.
+    case hotkeyPressed
+    /// Reply to `unregister_hotkey`. Always emitted, even when no hot key
+    /// was registered (the `unregister` call is idempotent).
+    case hotkeyUnregistered
 
     private enum CodingKeys: String, CodingKey {
         case event
@@ -157,6 +215,9 @@ enum Event: Equatable {
         case newDisplayId = "new_display_id"
         case newWidthPx = "new_width_px"
         case newHeightPx = "new_height_px"
+        case status
+        case modifiers
+        case key
     }
 
     private enum EventKind: String, Codable {
@@ -173,6 +234,9 @@ enum Event: Equatable {
         case videoFile = "video_file"
         case displayReconfigured = "display_reconfigured"
         case captureEndedBySystemEvent = "capture_ended_by_system_event"
+        case hotkeyRegistered = "hotkey_registered"
+        case hotkeyPressed = "hotkey_pressed"
+        case hotkeyUnregistered = "hotkey_unregistered"
     }
 }
 
@@ -232,6 +296,16 @@ extension Event: Codable {
             let r = try container.decode(SystemEventReason.self, forKey: .reason)
             let off = try container.decode(Double.self, forKey: .atOffsetSeconds)
             self = .captureEndedBySystemEvent(reason: r, atOffsetSeconds: off)
+        case .hotkeyRegistered:
+            let s = try container.decode(HotkeyRegistrationStatus.self, forKey: .status)
+            let mods = try container.decode([HotkeyModifier].self, forKey: .modifiers)
+            let k = try container.decode(String.self, forKey: .key)
+            let m = try container.decode(String.self, forKey: .message)
+            self = .hotkeyRegistered(status: s, modifiers: mods, key: k, message: m)
+        case .hotkeyPressed:
+            self = .hotkeyPressed
+        case .hotkeyUnregistered:
+            self = .hotkeyUnregistered
         }
     }
 
@@ -289,6 +363,16 @@ extension Event: Codable {
             try container.encode(EventKind.captureEndedBySystemEvent, forKey: .event)
             try container.encode(reason, forKey: .reason)
             try container.encode(offset, forKey: .atOffsetSeconds)
+        case .hotkeyRegistered(let status, let mods, let key, let message):
+            try container.encode(EventKind.hotkeyRegistered, forKey: .event)
+            try container.encode(status, forKey: .status)
+            try container.encode(mods, forKey: .modifiers)
+            try container.encode(key, forKey: .key)
+            try container.encode(message, forKey: .message)
+        case .hotkeyPressed:
+            try container.encode(EventKind.hotkeyPressed, forKey: .event)
+        case .hotkeyUnregistered:
+            try container.encode(EventKind.hotkeyUnregistered, forKey: .event)
         }
     }
 }

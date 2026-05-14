@@ -27,9 +27,13 @@ from record.ipc import (
     CaptureEndedBySystemEventEvent,
     DisplayReconfiguredEvent,
     ErrorEvent,
+    HotkeyPressedEvent,
+    HotkeyRegisteredEvent,
+    HotkeyUnregisteredEvent,
     PermissionDeniedEvent,
     PermissionRequiredEvent,
     ReadyEvent,
+    RegisterHotkeyCommand,
     ShutdownCommand,
     SourceAttachedEvent,
     SourceLostEvent,
@@ -37,6 +41,7 @@ from record.ipc import (
     StartedEvent,
     StopCommand,
     StoppedEvent,
+    UnregisterHotkeyCommand,
     VideoConfig,
     VideoFileEvent,
     VideoLostEvent,
@@ -60,6 +65,8 @@ COMMAND_FIXTURES: list[tuple[str, type]] = [
     ("start_with_video.json", StartCommand),
     ("stop.json", StopCommand),
     ("shutdown.json", ShutdownCommand),
+    ("register_hotkey.json", RegisterHotkeyCommand),
+    ("unregister_hotkey.json", UnregisterHotkeyCommand),
 ]
 
 EVENT_FIXTURES: list[tuple[str, type]] = [
@@ -80,6 +87,9 @@ EVENT_FIXTURES: list[tuple[str, type]] = [
     ("video_file.json", VideoFileEvent),
     ("display_reconfigured.json", DisplayReconfiguredEvent),
     ("capture_ended_by_system_event.json", CaptureEndedBySystemEventEvent),
+    ("hotkey_registered.json", HotkeyRegisteredEvent),
+    ("hotkey_pressed.json", HotkeyPressedEvent),
+    ("hotkey_unregistered.json", HotkeyUnregisteredEvent),
 ]
 
 
@@ -223,6 +233,70 @@ def test_capture_ended_by_system_event_accepts_each_reason(reason: str) -> None:
     line = serialize_event(evt)
     parsed = parse_event(line)
     assert parsed == evt
+
+
+# ---------------------------------------------------------------------------
+# Hotkey IPC (spec 003 slice 5)
+# ---------------------------------------------------------------------------
+
+
+def test_register_hotkey_command_object_round_trip() -> None:
+    cmd = RegisterHotkeyCommand(modifiers=["cmd", "option"], key="r")
+    line = serialize_command(cmd)
+    parsed = parse_command(line)
+    assert parsed == cmd
+
+
+def test_unregister_hotkey_command_object_round_trip() -> None:
+    cmd = UnregisterHotkeyCommand()
+    line = serialize_command(cmd)
+    parsed = parse_command(line)
+    assert parsed == cmd
+
+
+@pytest.mark.parametrize(
+    "status,message",
+    [
+        ("registered", "registered"),
+        ("conflict", "another application has registered this combination"),
+        ("invalid", "accessibility_denied"),
+    ],
+)
+def test_hotkey_registered_event_object_round_trip(
+    status: str, message: str
+) -> None:
+    evt = HotkeyRegisteredEvent(
+        status=status,  # type: ignore[arg-type]
+        modifiers=["cmd", "option"],
+        key="r",
+        message=message,
+    )
+    line = serialize_event(evt)
+    parsed = parse_event(line)
+    assert parsed == evt
+
+
+def test_hotkey_pressed_event_object_round_trip() -> None:
+    evt = HotkeyPressedEvent()
+    line = serialize_event(evt)
+    parsed = parse_event(line)
+    assert parsed == evt
+
+
+def test_hotkey_unregistered_event_object_round_trip() -> None:
+    evt = HotkeyUnregisteredEvent()
+    line = serialize_event(evt)
+    parsed = parse_event(line)
+    assert parsed == evt
+
+
+def test_hotkey_registered_event_message_is_required() -> None:
+    """Swift always sends a ``message`` — the field must not be optional."""
+    with pytest.raises((ValidationError, ValueError)):
+        parse_event(
+            '{"event":"hotkey_registered","status":"registered",'
+            '"modifiers":["cmd","option"],"key":"r"}'
+        )
 
 
 # ---------------------------------------------------------------------------

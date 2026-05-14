@@ -64,6 +64,16 @@ struct CLIFlags {
     /// with `--simulate-video-failure-after-seconds` (synthetic failure
     /// injection runs against the synthetic source too).
     var testSyntheticVideo: Bool = false
+    /// When true, the binary runs in **daemon mode**: it does NOT start a
+    /// capture implicitly. It emits `ready`, idles on the main RunLoop, and
+    /// services repeated `start` / `stop` cycles over stdin. After each
+    /// `stopped` event, `capture` is set back to `nil` and the process stays
+    /// alive — the orchestrator can issue another `start` against the same
+    /// long-lived child. Only `shutdown` (explicit), EOF on stdin, or SIGTERM
+    /// terminate the process. Composes cleanly with `--test-silent-sources`
+    /// and `--test-synthetic-video`. Absent the flag, behavior is bit-for-bit
+    /// unchanged from the legacy one-shot mode (`exit(0)` after `stopped`).
+    var daemon: Bool = false
 }
 
 /// Parse CLI flags before any IPC begins. Supported flags:
@@ -93,6 +103,11 @@ func parseCLIFlags() -> CLIFlags {
             i += 1
         case "--test-synthetic-video":
             flags.testSyntheticVideo = true
+            i += 1
+        case "--daemon":
+            // Order-independent boolean flag, no value argument. Composes
+            // with `--test-silent-sources` and `--test-synthetic-video`.
+            flags.daemon = true
             i += 1
         case "--simulate-video-failure-after-seconds":
             // Consume the following positional value. Accept either an Int or
@@ -130,6 +145,13 @@ private func emitCLIFlagErrorAndExit(message: String) -> Never {
 
 let cliFlags = parseCLIFlags()
 let testSilentSources = cliFlags.testSilentSources
+/// Top-level mirror of `cliFlags.daemon` for readability in the stop / dispatch
+/// paths. See `CLIFlags.daemon` for semantics. When false (the legacy default),
+/// the binary preserves the original one-shot behavior — `handleStop` exits the
+/// process immediately after emitting `stopped`. When true, the same path
+/// drops `capture` to nil and leaves the main RunLoop running so another
+/// `start` can be serviced over stdin.
+let daemonMode = cliFlags.daemon
 
 // MARK: - Video startup error discrimination
 
@@ -233,6 +255,30 @@ final class CaptureState {
 }
 
 var capture: CaptureState? = nil
+
+// MARK: - Hotkey monitor
+
+/// Single process-wide `HotkeyMonitor`. Constructed lazily on the first
+/// `register_hotkey` command so the legacy one-shot path (which never
+/// sends hotkey commands) doesn't pay the cost of installing the Carbon
+/// event handler. The closure emits `hotkey_pressed` via the existing
+/// `emit(...)` lock convention.
+///
+/// Race-mitigation per tech spec §3 ("Race: user presses hotkey while
+/// daemon is mid-startup"): `register()` is synchronous and completes
+/// before we emit `hotkey_registered`; any subsequent press dispatches
+/// onto the main queue, where it is well-ordered after the registration
+/// event already on the wire.
+var hotkeyMonitor: HotkeyMonitor? = nil
+
+func ensureHotkeyMonitor() -> HotkeyMonitor {
+    if let m = hotkeyMonitor { return m }
+    let m = HotkeyMonitor(onPress: {
+        emit(.hotkeyPressed)
+    })
+    hotkeyMonitor = m
+    return m
+}
 
 // MARK: - SIGTERM handler
 
@@ -582,8 +628,98 @@ func handleStop() {
         }
 
         emit(.stopped(durationSeconds: audioDur, outputPath: state.outputPath))
-        exit(0)
+
+        if daemonMode {
+            // Daemon mode: keep the process alive and reset for the next
+            // `start`. Dropping the only strong reference to `CaptureState`
+            // is what releases every per-capture resource (AudioCapture,
+            // VideoSource, MP4Writer, DisplayReconfigurationMonitor,
+            // SystemEventMonitor). The leak audit accompanying slice 4
+            // verifies each of those classes' `stop()` paths fully releases
+            // observers / streams / taps / DispatchSources, so this single
+            // assignment is the complete teardown trigger.
+            //
+            // The stdin thread is still running and the RunLoop is still
+            // turning, so a subsequent `start` command will land on the
+            // main queue and bring up a fresh capture.
+            capture = nil
+        } else {
+            // One-shot mode (legacy / supervisor.py / 001+002 integration
+            // suite): behavior must be byte-for-byte identical to before
+            // slice 4. Exit immediately after `stopped`.
+            exit(0)
+        }
     }
+}
+
+// MARK: - Hotkey command handlers
+
+/// Handle `register_hotkey`. Validates the modifier list and key against
+/// the closed grammar without touching Carbon (so we can fail loud on
+/// obviously bad input without producing an `unknown_osstatus_*` token),
+/// then calls into `HotkeyMonitor.register` and emits one
+/// `hotkey_registered` event with the outcome. Always runs on the main
+/// queue (the stdin reader dispatches here).
+func handleRegisterHotkey(modifiers: [HotkeyModifier], key: String) {
+    // FR 2.6 requires at least one modifier. Reject before we even
+    // construct the monitor so the `accessibility_denied` probe doesn't
+    // race ahead of a structurally-invalid request.
+    if modifiers.isEmpty {
+        emit(.hotkeyRegistered(
+            status: .invalid,
+            modifiers: modifiers,
+            key: key,
+            message: "no_modifiers"
+        ))
+        return
+    }
+    // Closed-grammar key validation. Mirrors the Python parser in
+    // `src/record/hotkey.py`; the daemon shouldn't ship anything out of
+    // range here, but failing loud beats silently sending a zero keycode
+    // to Carbon (which would map to "a").
+    guard let code = keyCode(for: key) else {
+        emit(.hotkeyRegistered(
+            status: .invalid,
+            modifiers: modifiers,
+            key: key,
+            message: "unknown_key:\(key)"
+        ))
+        return
+    }
+    let mask = modifierMask(from: modifiers)
+    let monitor = ensureHotkeyMonitor()
+    let result = monitor.register(modifiers: mask, keyCode: code)
+    switch result {
+    case .registered:
+        emit(.hotkeyRegistered(
+            status: .registered,
+            modifiers: modifiers,
+            key: key,
+            message: "registered"
+        ))
+    case .conflict:
+        emit(.hotkeyRegistered(
+            status: .conflict,
+            modifiers: modifiers,
+            key: key,
+            message: "conflict"
+        ))
+    case .invalid(let message):
+        emit(.hotkeyRegistered(
+            status: .invalid,
+            modifiers: modifiers,
+            key: key,
+            message: message
+        ))
+    }
+}
+
+/// Handle `unregister_hotkey`. Idempotent — calling against a never-
+/// constructed monitor is a no-op (the `hotkey_unregistered` event is
+/// still emitted so the orchestrator gets the ack it's waiting on).
+func handleUnregisterHotkey() {
+    hotkeyMonitor?.unregister()
+    emit(.hotkeyUnregistered)
 }
 
 // MARK: - Stdin reader
@@ -624,6 +760,10 @@ let stdinThread = Thread {
                 handleStop()
             case .shutdown:
                 exit(0)
+            case .registerHotkey(let modifiers, let key):
+                handleRegisterHotkey(modifiers: modifiers, key: key)
+            case .unregisterHotkey:
+                handleUnregisterHotkey()
             }
         }
     }

@@ -65,7 +65,13 @@ final class ProtocolTests: XCTestCase {
                 )
             ),
             ("stop", .stop),
-            ("shutdown", .shutdown)
+            ("shutdown", .shutdown),
+            // Slice 5: hotkey commands.
+            (
+                "register_hotkey",
+                .registerHotkey(modifiers: [.cmd, .option], key: "r")
+            ),
+            ("unregister_hotkey", .unregisterHotkey)
         ]
     }
 
@@ -168,7 +174,19 @@ final class ProtocolTests: XCTestCase {
                     reason: .systemSleep,
                     atOffsetSeconds: 134.2
                 )
-            )
+            ),
+            // Slice 5: hotkey events.
+            (
+                "hotkey_registered",
+                .hotkeyRegistered(
+                    status: .registered,
+                    modifiers: [.cmd, .option],
+                    key: "r",
+                    message: "registered"
+                )
+            ),
+            ("hotkey_pressed", .hotkeyPressed),
+            ("hotkey_unregistered", .hotkeyUnregistered)
         ]
     }
 

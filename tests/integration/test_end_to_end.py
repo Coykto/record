@@ -25,9 +25,12 @@ probe for AVAsset playback validation. No project Python modules are imported
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import struct
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import wave
@@ -734,3 +737,442 @@ def test_end_to_end_silent_sources_with_synthetic_video(
                 proc.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Daemon-driven variant (spec 003 slice 2)
+#
+# Spawns ``python -m record.daemon`` as a real subprocess against a sandboxed
+# ``$HOME`` (short ``/tmp/...`` path so ``AF_UNIX`` fits inside macOS's 104-char
+# limit), then drives a ``start`` / ``stop`` cycle over the daemon's control
+# socket. The Swift child is launched in synthetic mode via the
+# ``RECORD_CAPTURE_TEST_FLAGS`` env var that ``record.capture`` reads.
+# ---------------------------------------------------------------------------
+
+
+def _wait_for_socket(socket_path: Path, *, timeout: float) -> bool:
+    """Poll up to ``timeout`` seconds for the daemon to bind ``socket_path``."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if socket_path.exists():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _send_control_request(
+    socket_path: Path, payload: dict, *, timeout: float = 30.0
+) -> dict:
+    """Open the daemon socket, send one JSON request line, read one response."""
+    import socket as _socket
+
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect(str(socket_path))
+    try:
+        sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        buf = b""
+        deadline = time.monotonic() + timeout
+        while b"\n" not in buf and time.monotonic() < deadline:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        line, _, _ = buf.partition(b"\n")
+        if not line:
+            pytest.fail("daemon closed the socket without responding")
+        return json.loads(line.decode("utf-8"))
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def test_end_to_end_daemon_driven_start_stop(
+    capture_binary: Path,
+) -> None:
+    """``record.daemon`` end-to-end: spawn daemon → start → stop → quit.
+
+    Verifies:
+      - the daemon binds its socket;
+      - a ``start`` request produces a capture (audio+video files materialize);
+      - ``capture-state.json`` is finalized with ``final: true``;
+      - a ``quit`` request returns ``ok`` and the daemon exits cleanly.
+    """
+    # Sandbox $HOME so the daemon writes its PID file, socket, log, and
+    # state file inside a throwaway directory. The path is intentionally
+    # short (`/tmp/rd-XXXX`) — we explicitly set ``dir="/tmp"`` because the
+    # default ``$TMPDIR`` on macOS points at ``/var/folders/.../T/`` which
+    # blows past the 104-character ``AF_UNIX`` path limit once we append
+    # ``Library/Application Support/record/daemon.sock``.
+    sandbox = Path(tempfile.mkdtemp(prefix="rd-", dir="/tmp"))
+    cwd = sandbox / "out"
+    cwd.mkdir()
+    # Resolve symlinks (``/tmp`` -> ``/private/tmp`` on macOS) so the
+    # equality check against the daemon-returned path lines up.
+    cwd_resolved = cwd.resolve()
+
+    # Slice 3 routes captures through ``Config.output_folder`` (default
+    # ``~/record/``). Point it at the test's CWD via a sandboxed config file.
+    config_dir = sandbox / ".config" / "record"
+    config_dir.mkdir(parents=True)
+    log_dir = sandbox / "logs"
+    log_dir.mkdir()
+    (config_dir / "config.toml").write_text(
+        f'output_folder = "{cwd_resolved}"\nlog_folder = "{log_dir.resolve()}"\n',
+        encoding="utf-8",
+    )
+
+    env = dict(os.environ)
+    env["HOME"] = str(sandbox)
+    # Force the Swift child into synthetic mode (no TCC needed in CI).
+    env["RECORD_CAPTURE_TEST_FLAGS"] = "--test-silent-sources --test-synthetic-video"
+
+    daemon_proc = subprocess.Popen(
+        [sys.executable, "-m", "record.daemon"],
+        cwd=str(cwd),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    socket_path = (
+        sandbox / "Library" / "Application Support" / "record" / "daemon.sock"
+    )
+    state_path = (
+        sandbox / "Library" / "Application Support" / "record" / "capture-state.json"
+    )
+
+    try:
+        # Wait for the daemon to bind its socket.
+        if not _wait_for_socket(socket_path, timeout=10.0):
+            assert daemon_proc.stderr is not None
+            try:
+                stderr_dump = daemon_proc.stderr.read() or ""
+            except Exception:
+                stderr_dump = ""
+            pytest.fail(
+                f"daemon did not bind socket at {socket_path} within 10s; "
+                f"stderr:\n{stderr_dump}"
+            )
+
+        # ----- start -----------------------------------------------------
+        start_resp = _send_control_request(socket_path, {"op": "start"})
+        assert start_resp["status"] == "ok", start_resp
+        audio_path = Path(start_resp["audio_path"])
+        video_path = Path(start_resp["video_path"])
+        assert audio_path.parent == cwd_resolved, audio_path
+        assert video_path.parent == cwd_resolved, video_path
+
+        # Let the synthetic capture run briefly so it produces real frames.
+        time.sleep(2.0)
+
+        # ----- status (sanity check) ------------------------------------
+        status_resp = _send_control_request(socket_path, {"op": "status"})
+        assert status_resp["status"] == "ok"
+        assert status_resp["capture"]["running"] is True
+
+        # ----- stop ------------------------------------------------------
+        stop_resp = _send_control_request(
+            socket_path, {"op": "stop"}, timeout=30.0
+        )
+        assert stop_resp["status"] == "ok", stop_resp
+
+        # Files materialised in the configured (CWD) directory.
+        assert audio_path.exists(), f"audio file missing at {audio_path}"
+        assert video_path.exists(), f"video file missing at {video_path}"
+
+        # capture-state.json should be finalized.
+        assert state_path.exists()
+        final_state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert final_state.get("final") is True, final_state
+        assert final_state.get("output_path") == str(audio_path)
+
+        # ----- quit ------------------------------------------------------
+        quit_resp = _send_control_request(socket_path, {"op": "quit"})
+        assert quit_resp["status"] == "ok"
+
+        # Daemon should exit cleanly.
+        try:
+            daemon_proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            pytest.fail("daemon did not exit within 10s after quit request")
+        assert daemon_proc.returncode == 0, (
+            f"daemon exited with code {daemon_proc.returncode}"
+        )
+
+        # MP4 opens cleanly via the same probe the synthetic-video test uses.
+        width, height, mp4_duration = _probe_mp4(video_path)
+        assert width == SYNTHETIC_VIDEO_WIDTH
+        assert height == SYNTHETIC_VIDEO_HEIGHT
+        assert mp4_duration > 0.5
+
+        # WAV format sanity.
+        with wave.open(str(audio_path), "rb") as wf:
+            assert wf.getnchannels() == EXPECTED_CHANNELS
+            assert wf.getframerate() == EXPECTED_SAMPLE_RATE
+            assert wf.getsampwidth() == EXPECTED_SAMPWIDTH_BYTES
+            nframes = wf.getnframes()
+        wav_duration = nframes / EXPECTED_SAMPLE_RATE
+        assert wav_duration > 0.5
+    finally:
+        if daemon_proc.poll() is None:
+            try:
+                daemon_proc.send_signal(15)  # SIGTERM
+                daemon_proc.wait(timeout=5.0)
+            except Exception:
+                pass
+        if daemon_proc.poll() is None:
+            try:
+                daemon_proc.kill()
+            except Exception:
+                pass
+
+        if daemon_proc.stderr is not None:
+            try:
+                stderr_dump = daemon_proc.stderr.read() or ""
+            except Exception:
+                stderr_dump = ""
+            if stderr_dump:
+                print(f"record.daemon stderr:\n{stderr_dump}")
+
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Slice 4 — 3 back-to-back captures driven by one long-lived Swift child
+#
+# Verifies that the daemon spawns a single ``record-capture --daemon`` child
+# at startup and reuses it for every capture, per spec 003 slice 4. Asserts:
+#
+#   * Each cycle produces fresh ``.wav`` + ``.mp4`` artifacts under distinct
+#     filename stems and all three pairs survive on disk after cycle 3.
+#   * ``capture-state.json`` reflects only the most recent capture but is
+#     finalized (``final: true``) after each stop.
+#   * The daemon's open-fd count (via ``psutil``) does not grow monotonically
+#     across the three cycles — caps the "did we leak a pipe / socket per
+#     capture" regression that motivated the slice-4 audit.
+#   * All three MP4s open cleanly via the same ``_probe_mp4`` helper used by
+#     the synthetic-video pair test (dimensions + duration sanity).
+#   * After cycle 3, ``quit`` returns ``ok`` and the daemon exits cleanly.
+# ---------------------------------------------------------------------------
+
+
+def test_end_to_end_daemon_driven_three_cycles(
+    capture_binary: Path,
+) -> None:
+    """Drive three start/stop cycles through one daemon-spawned Swift child.
+
+    The cycle inputs are identical to ``test_end_to_end_daemon_driven_start_stop``
+    (same synthetic-source flags, same control socket protocol) — what's
+    different is the daemon's internal state. In slice-2 each cycle would
+    have spawned a fresh ``record-capture`` subprocess; in slice 4 the daemon
+    re-uses one long-lived ``--daemon`` child. This test pins that contract
+    and adds an fd-stability check as the load-bearing leak gate.
+    """
+    psutil = pytest.importorskip("psutil")  # CI-friendly; declared in pyproject.toml
+
+    # See ``test_end_to_end_daemon_driven_start_stop`` for why ``/tmp`` is
+    # hard-coded (104-char AF_UNIX limit on macOS).
+    sandbox = Path(tempfile.mkdtemp(prefix="rd-", dir="/tmp"))
+    cwd = sandbox / "out"
+    cwd.mkdir()
+    cwd_resolved = cwd.resolve()
+
+    config_dir = sandbox / ".config" / "record"
+    config_dir.mkdir(parents=True)
+    log_dir = sandbox / "logs"
+    log_dir.mkdir()
+    (config_dir / "config.toml").write_text(
+        f'output_folder = "{cwd_resolved}"\nlog_folder = "{log_dir.resolve()}"\n',
+        encoding="utf-8",
+    )
+
+    env = dict(os.environ)
+    env["HOME"] = str(sandbox)
+    env["RECORD_CAPTURE_TEST_FLAGS"] = (
+        "--test-silent-sources --test-synthetic-video"
+    )
+
+    daemon_proc = subprocess.Popen(
+        [sys.executable, "-m", "record.daemon"],
+        cwd=str(cwd),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    socket_path = (
+        sandbox / "Library" / "Application Support" / "record" / "daemon.sock"
+    )
+    state_path = (
+        sandbox / "Library" / "Application Support" / "record" / "capture-state.json"
+    )
+
+    # Per-cycle capture window. Stays short on purpose: total wall-clock
+    # budget for the test is ~6 s (1.5 s × 3 + Swift bring-up + finalize).
+    cycle_window_seconds = 1.5
+
+    # fd-count slack across cycles. Healthy churn (e.g. a transient stderr
+    # drain pipe being recycled, asyncio internals) can move the count by a
+    # few; we only fail on monotonic growth that would indicate a leaked
+    # pipe / socket per capture.
+    fd_growth_slack = 5
+
+    try:
+        if not _wait_for_socket(socket_path, timeout=10.0):
+            assert daemon_proc.stderr is not None
+            try:
+                stderr_dump = daemon_proc.stderr.read() or ""
+            except Exception:
+                stderr_dump = ""
+            pytest.fail(
+                f"daemon did not bind socket at {socket_path} within 10s; "
+                f"stderr:\n{stderr_dump}"
+            )
+
+        daemon_psutil = psutil.Process(daemon_proc.pid)
+        baseline_fds = daemon_psutil.num_fds()
+
+        cycle_paths: list[tuple[Path, Path]] = []
+        fds_after_cycle: list[int] = []
+
+        for cycle_idx in range(3):
+            start_resp = _send_control_request(socket_path, {"op": "start"})
+            assert start_resp["status"] == "ok", (
+                f"cycle {cycle_idx}: start failed: {start_resp!r}"
+            )
+            audio_path = Path(start_resp["audio_path"])
+            video_path = Path(start_resp["video_path"])
+            assert audio_path.parent == cwd_resolved, audio_path
+            assert video_path.parent == cwd_resolved, video_path
+
+            # Let the synthetic feed produce real frames for a beat.
+            time.sleep(cycle_window_seconds)
+
+            stop_resp = _send_control_request(
+                socket_path, {"op": "stop"}, timeout=30.0
+            )
+            assert stop_resp["status"] == "ok", (
+                f"cycle {cycle_idx}: stop failed: {stop_resp!r}"
+            )
+
+            # Per-cycle artifacts materialise.
+            assert audio_path.exists(), (
+                f"cycle {cycle_idx}: audio file missing at {audio_path}"
+            )
+            assert video_path.exists(), (
+                f"cycle {cycle_idx}: video file missing at {video_path}"
+            )
+            cycle_paths.append((audio_path, video_path))
+
+            # capture-state.json is finalized + reflects THIS cycle's audio
+            # path (the daemon overwrites it per-capture).
+            assert state_path.exists()
+            final_state = json.loads(state_path.read_text(encoding="utf-8"))
+            assert final_state.get("final") is True, (
+                f"cycle {cycle_idx}: state not finalized: {final_state!r}"
+            )
+            assert final_state.get("output_path") == str(audio_path), (
+                f"cycle {cycle_idx}: state.output_path mismatch: {final_state!r}"
+            )
+
+            # Record fd count. We sample once per cycle, after stop has
+            # fully unwound — that's the cleanest moment to compare across
+            # cycles because no transient asyncio pipes are open.
+            fds_after_cycle.append(daemon_psutil.num_fds())
+
+        # All three pairs of files survive on disk and use distinct stems.
+        all_audio_paths = [p[0] for p in cycle_paths]
+        all_video_paths = [p[1] for p in cycle_paths]
+        all_stems = {p.stem for p in all_audio_paths}
+        assert len(all_stems) == 3, (
+            f"expected 3 distinct filename stems, got {sorted(all_stems)!r}"
+        )
+        for audio_path, video_path in cycle_paths:
+            assert audio_path.exists(), (
+                f"audio path {audio_path} disappeared between cycles"
+            )
+            assert video_path.exists(), (
+                f"video path {video_path} disappeared between cycles"
+            )
+            assert audio_path.stem == video_path.stem, (
+                f"per-cycle wav/mp4 stems do not match: "
+                f"{audio_path.stem!r} vs {video_path.stem!r}"
+            )
+
+        # fd-stability gate. The headline contract: cycle-3 fd count must not
+        # have grown beyond cycle-1's by more than ``fd_growth_slack``. A
+        # leak would manifest as steady growth (one extra pipe per cycle).
+        assert fds_after_cycle[2] <= fds_after_cycle[0] + fd_growth_slack, (
+            f"fd count grew across cycles: baseline={baseline_fds}, "
+            f"after-cycle counts={fds_after_cycle!r}; suggests a per-capture "
+            f"resource leak in the daemon or Swift child"
+        )
+
+        # Every MP4 opens cleanly through the same probe the synthetic-video
+        # pair test uses — covers the "Swift recycled across cycles still
+        # writes a valid file" invariant from the slice-4 audit.
+        for audio_path, video_path in cycle_paths:
+            width, height, mp4_duration = _probe_mp4(video_path)
+            assert width == SYNTHETIC_VIDEO_WIDTH, (
+                f"{video_path}: width {width} != expected {SYNTHETIC_VIDEO_WIDTH}"
+            )
+            assert height == SYNTHETIC_VIDEO_HEIGHT, (
+                f"{video_path}: height {height} != expected {SYNTHETIC_VIDEO_HEIGHT}"
+            )
+            assert mp4_duration > 0.5, (
+                f"{video_path}: duration {mp4_duration:.3f}s too short "
+                f"(<0.5s) — finalizer likely truncated the file"
+            )
+
+            # WAV sanity for each cycle's audio file.
+            with wave.open(str(audio_path), "rb") as wf:
+                assert wf.getnchannels() == EXPECTED_CHANNELS
+                assert wf.getframerate() == EXPECTED_SAMPLE_RATE
+                assert wf.getsampwidth() == EXPECTED_SAMPWIDTH_BYTES
+                nframes = wf.getnframes()
+            wav_duration = nframes / EXPECTED_SAMPLE_RATE
+            assert wav_duration > 0.5, (
+                f"{audio_path}: WAV duration {wav_duration:.3f}s < 0.5s"
+            )
+            _ = all_video_paths  # silence flake8 unused; kept for symmetry
+
+        # ----- quit ------------------------------------------------------
+        quit_resp = _send_control_request(socket_path, {"op": "quit"})
+        assert quit_resp["status"] == "ok", quit_resp
+
+        try:
+            daemon_proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            pytest.fail("daemon did not exit within 10s after quit request")
+        assert daemon_proc.returncode == 0, (
+            f"daemon exited with code {daemon_proc.returncode}"
+        )
+    finally:
+        if daemon_proc.poll() is None:
+            try:
+                daemon_proc.send_signal(15)  # SIGTERM
+                daemon_proc.wait(timeout=5.0)
+            except Exception:
+                pass
+        if daemon_proc.poll() is None:
+            try:
+                daemon_proc.kill()
+            except Exception:
+                pass
+
+        if daemon_proc.stderr is not None:
+            try:
+                stderr_dump = daemon_proc.stderr.read() or ""
+            except Exception:
+                stderr_dump = ""
+            if stderr_dump:
+                print(f"record.daemon stderr:\n{stderr_dump}")
+
+        shutil.rmtree(sandbox, ignore_errors=True)

@@ -80,8 +80,59 @@ class ShutdownCommand(BaseModel):
     cmd: Literal["shutdown"] = "shutdown"
 
 
+# ---------------------------------------------------------------------------
+# Hotkey commands (spec 003 slice 5)
+# ---------------------------------------------------------------------------
+
+
+# Wire-level alias for the hotkey modifier set. Mirrors
+# :data:`record.hotkey.Modifier` but lives here because the wire schema is the
+# single source of truth on cross-process boundaries — the Swift side decodes
+# this same Literal set from the JSON line.
+Modifier = Literal["cmd", "option", "control", "shift"]
+
+#: Wire-level status enum carried in :class:`HotkeyRegisteredEvent`. The
+#: daemon translates these into the broader
+#: :class:`record.control.HotkeyInfo.state` set (which also has
+#: ``"unregistered"`` and ``"disabled_no_permission"`` — both daemon-side
+#: derivations, not wire values).
+HotkeyRegistrationStatus = Literal["registered", "conflict", "invalid"]
+
+
+class RegisterHotkeyCommand(BaseModel):
+    """Ask the Swift child to register a global hotkey via Carbon.
+
+    ``modifiers`` is a non-empty list drawn from the closed
+    :data:`Modifier` set. ``key`` is one non-modifier key — one of ``a-z``,
+    ``0-9``, ``f1``..``f20``, or a named whitelist (``space``, ``tab``,
+    ``return``, ``escape``, ``delete``). The grammar is enforced by
+    :func:`record.hotkey.parse` upstream; this model only carries the parsed
+    result across the wire.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cmd: Literal["register_hotkey"] = "register_hotkey"
+    modifiers: list[Modifier]
+    key: str
+
+
+class UnregisterHotkeyCommand(BaseModel):
+    """Ask the Swift child to release any currently registered hotkey."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cmd: Literal["unregister_hotkey"] = "unregister_hotkey"
+
+
 Command = Annotated[
-    Union[StartCommand, StopCommand, ShutdownCommand],
+    Union[
+        StartCommand,
+        StopCommand,
+        ShutdownCommand,
+        RegisterHotkeyCommand,
+        UnregisterHotkeyCommand,
+    ],
     Field(discriminator="cmd"),
 ]
 
@@ -223,6 +274,53 @@ class CaptureEndedBySystemEventEvent(BaseModel):
     at_offset_seconds: float
 
 
+# ---------------------------------------------------------------------------
+# Hotkey events (spec 003 slice 5)
+# ---------------------------------------------------------------------------
+
+
+class HotkeyRegisteredEvent(BaseModel):
+    """Emitted once per :class:`RegisterHotkeyCommand`.
+
+    Carries the wire-level outcome of the Carbon ``RegisterEventHotKey`` call
+    in :attr:`status`, the modifiers/key the call was for (echoed back so the
+    daemon doesn't need to remember what it asked for), and a human-readable
+    ``message`` the Python side may surface in ``record status``. The Swift
+    binary always emits a message — even on success — so the field is
+    required, not optional.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event: Literal["hotkey_registered"] = "hotkey_registered"
+    status: HotkeyRegistrationStatus
+    modifiers: list[Modifier]
+    key: str
+    message: str
+
+
+class HotkeyPressedEvent(BaseModel):
+    """Emitted once per physical press of the registered hotkey.
+
+    Only fires while a hotkey is currently registered — the Swift child never
+    emits this before a successful :class:`HotkeyRegisteredEvent` reply, so
+    the orchestrator's "press before registered" race is impossible by
+    construction (tech spec §3 race-mitigation row).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event: Literal["hotkey_pressed"] = "hotkey_pressed"
+
+
+class HotkeyUnregisteredEvent(BaseModel):
+    """Emitted in response to :class:`UnregisterHotkeyCommand`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event: Literal["hotkey_unregistered"] = "hotkey_unregistered"
+
+
 Event = Annotated[
     Union[
         ReadyEvent,
@@ -238,6 +336,9 @@ Event = Annotated[
         VideoFileEvent,
         DisplayReconfiguredEvent,
         CaptureEndedBySystemEventEvent,
+        HotkeyRegisteredEvent,
+        HotkeyPressedEvent,
+        HotkeyUnregisteredEvent,
     ],
     Field(discriminator="event"),
 ]
@@ -294,6 +395,8 @@ __all__ = [
     "StartCommand",
     "StopCommand",
     "ShutdownCommand",
+    "RegisterHotkeyCommand",
+    "UnregisterHotkeyCommand",
     "Command",
     "ReadyEvent",
     "PermissionRequiredEvent",
@@ -308,11 +411,16 @@ __all__ = [
     "VideoFileEvent",
     "DisplayReconfiguredEvent",
     "CaptureEndedBySystemEventEvent",
+    "HotkeyRegisteredEvent",
+    "HotkeyPressedEvent",
+    "HotkeyUnregisteredEvent",
     "Event",
     "SourceName",
     "PermissionKind",
     "VideoReconfigReason",
     "SystemEventReason",
+    "Modifier",
+    "HotkeyRegistrationStatus",
     "serialize_command",
     "parse_command",
     "serialize_event",

@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "typer",
     "pydantic",
+    "pydantic-settings",
     "structlog",
 ]
 
@@ -13,7 +14,7 @@ dependencies = [
 record = "record.cli:app"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "psutil>=5.9"]
 
 [build-system]
 requires = ["setuptools>=68"]

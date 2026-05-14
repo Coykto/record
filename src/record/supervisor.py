@@ -1,49 +1,32 @@
-"""Long-running supervisor process.
+"""Long-running per-capture supervisor process.
 
-The supervisor is spawned (detached, in its own session) by ``record start``.
-It owns the Swift ``record-capture`` subprocess for the entire capture
-lifetime, translating its JSON-line event stream into updates of
-``capture-state.json`` and structured log lines.
+Legacy entrypoint for the foreground ``python -m record.supervisor`` path that
+specs 001 and 002 stood up. Slice 2 of spec 003 dissolved the supervisor's
+per-capture orchestration into :class:`record.capture.CaptureSession` so the
+daemon can reuse it; this module is now a thin synchronous wrapper that
+drives one ``CaptureSession`` through start → wait-for-stopped → stop, plus
+the SIGTERM-forwards-to-stop behavior the spec-001 integration suite expects.
 
-Lifecycle:
-
-1. Resolve the bundled Swift binary via ``importlib.resources``.
-2. Spawn it with line-buffered text pipes; start a stderr-draining thread
-   that appends to ``daemon.log``.
-3. Issue the ``start`` command immediately.
-4. Read events on stdout; persist state, log, react.
-5. On SIGTERM (sent by ``record stop``), forward a ``stop`` command into the
-   Swift binary's stdin and continue draining stdout until it closes.
-6. Finalize ``capture-state.json`` and exit.
-
-Invocation: ``python -m record.supervisor --output-path /abs/path.wav``.
-We pick CLI args (rather than env vars) for the supervisor because the
-output path is the only required value and it's easier to debug from
-``ps aux`` when it appears in the command line.
+The ``record start`` / ``record stop`` CLI commands no longer spawn this
+module — spec 003 slice 2 routes them through the daemon's control socket
+instead. ``python -m record.supervisor`` remains reachable as an offline test
+path and is exercised by the integration suite.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import signal
-import subprocess
 import sys
 import threading
-from datetime import datetime, timezone
-from importlib.resources import as_file, files
 from pathlib import Path
-from typing import Any
 
-from pydantic import ValidationError
-
-from . import ipc, paths, state
+from . import paths, state
+from .capture import CaptureFailedToStart, CaptureSession, _utcnow_iso
 from .logging_setup import configure_logging, get_logger
 
-# Exit codes used by the supervisor itself. CLI-facing exit codes (1, 2, 3, 4)
-# live in cli.py; the supervisor's exits are mostly observed by `record stop`
-# via state-file inspection rather than by direct exit-code reading, but we
-# still pick informative numbers.
 _EXIT_OK = 0
 _EXIT_BINARY_MISSING = 10
 _EXIT_BINARY_ABNORMAL = 11
@@ -51,264 +34,97 @@ _EXIT_BINARY_ABNORMAL = 11
 _log = get_logger("record.supervisor")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+async def _run_session(
+    *,
+    output_path: Path,
+    sample_rate: int,
+    bit_depth: int,
+    channels: int,
+    video_output_path: Path | None,
+    daemon_log_path: Path,
+) -> int:
+    """Drive one :class:`CaptureSession` for the foreground supervisor path.
 
-
-def _utcnow_iso() -> str:
-    """Return the current UTC time as a Z-suffixed ISO-8601 string."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _resolve_binary() -> Path | None:
-    """Resolve the bundled Swift binary's path on disk.
-
-    Returns ``None`` if the binary is missing or not executable.
+    Returns the desired process exit code so :func:`main` can sys.exit it.
     """
+    session = CaptureSession(
+        output_path=output_path,
+        video_output_path=video_output_path,
+        sample_rate=sample_rate,
+        bit_depth=bit_depth,
+        channels=channels,
+        daemon_log_path=daemon_log_path,
+        owner_pid=os.getpid(),
+    )
+
+    # SIGTERM/SIGINT handler: forward a ``stop`` via the session. Mirrors the
+    # legacy supervisor's behavior — the only signal-handling site in this
+    # process is here. We use a threading.Event so the handler is signal-safe
+    # (asyncio.Event.set is not), and a small bridge task to forward into the
+    # event loop.
+    stop_requested = threading.Event()
+    loop = asyncio.get_running_loop()
+    stop_future: asyncio.Future[None] = loop.create_future()
+
+    def _handle_signal(signum: int, _frame: object) -> None:
+        if stop_requested.is_set():
+            return
+        stop_requested.set()
+        _log.info("sigterm_received", signal=signum)
+        # Schedule the future-resolve on the loop thread.
+        try:
+            loop.call_soon_threadsafe(_finalize_stop_future)
+        except RuntimeError:  # pragma: no cover - defensive
+            pass
+
+    def _finalize_stop_future() -> None:
+        if not stop_future.done():
+            stop_future.set_result(None)
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     try:
-        resource = files("record") / "bin" / "record-capture"
-    except (ModuleNotFoundError, FileNotFoundError):
-        return None
+        await session.start()
+    except CaptureFailedToStart as exc:
+        warnings = exc.final_state.get("warnings", [])
+        binary_missing = any(
+            isinstance(w, dict)
+            and (
+                "capture binary missing" in (w.get("message") or "").lower()
+                or "binary missing" in (w.get("message") or "").lower()
+            )
+            for w in warnings
+        )
+        if binary_missing:
+            return _EXIT_BINARY_MISSING
+        return _EXIT_BINARY_ABNORMAL
 
-    # `as_file` materializes a real filesystem path even if the package is
-    # installed in a zip. For an editable install it's a no-op.
+    # Wait for either a user-initiated stop (SIGTERM) or the binary stopping
+    # on its own (system-event-triggered shutdown).
+    stopped_wait = asyncio.create_task(session.stopped_event.wait())
+    sig_wait = asyncio.create_task(stop_future)
     try:
-        with as_file(resource) as path:
-            target = Path(path)
-            if not target.exists() or not os.access(target, os.X_OK):
-                return None
-            return target
-    except (FileNotFoundError, ModuleNotFoundError):
-        return None
-
-
-def _drain_stderr(proc: subprocess.Popen[str], log_path: Path) -> None:
-    """Append the binary's stderr line-by-line to ``daemon.log``.
-
-    Runs in a background thread for the lifetime of the subprocess. Best
-    effort — IO errors here are logged at warning level to the orchestrator
-    log but don't terminate the supervisor.
-    """
-    assert proc.stderr is not None
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(log_path, "a", encoding="utf-8") as fp:
-            for line in proc.stderr:
-                fp.write(line if line.endswith("\n") else line + "\n")
-                fp.flush()
-    except Exception as exc:  # pragma: no cover - defensive
-        _log.warning("daemon_stderr_drain_failed", error=str(exc))
-
-
-# ---------------------------------------------------------------------------
-# State machine
-# ---------------------------------------------------------------------------
-
-
-def _initial_state(supervisor_pid: int) -> dict[str, Any]:
-    """Build the state dict written when the binary first emits ``ready``."""
-    return {
-        "pid": supervisor_pid,
-        "start_time": None,
-        "output_path": None,
-        "video_output_path": None,
-        "sources": {
-            "mic": {
-                "status": "never_attached",
-                "attached_at": None,
-                "lost_at": None,
-            },
-            "system_audio": {
-                "status": "never_attached",
-                "attached_at": None,
-                "lost_at": None,
-            },
-            "video": {
-                "status": "never_attached",
-                "attached_at": None,
-                "lost_at": None,
-                "display_id": None,
-                "width_px": None,
-                "height_px": None,
-                "fps": None,
-            },
-        },
-        "warnings": [],
-        "display_changes": [],
-        "ended_by": None,
-        "last_event_at": _utcnow_iso(),
-        "final": False,
-    }
-
-
-def _apply_event(current: dict[str, Any], event: ipc.Event) -> dict[str, Any]:
-    """Return an updated state dict reflecting ``event``.
-
-    Pure-ish: only depends on its inputs and the current wall clock. The
-    caller is responsible for persisting the result.
-    """
-    now = _utcnow_iso()
-    current["last_event_at"] = now
-
-    if isinstance(event, ipc.ReadyEvent):
-        # Already initialized at spawn time; nothing extra to record.
-        return current
-
-    if isinstance(event, ipc.StartedEvent):
-        current["start_time"] = event.start_time
-        # output_path was set when the supervisor sent the `start` command;
-        # we keep it from the command issuance rather than re-deriving it.
-        return current
-
-    if isinstance(event, ipc.SourceAttachedEvent):
-        src = current["sources"][event.source]
-        src["status"] = "attached"
-        src["attached_at"] = now
-        # `lost_at` stays null unless the source had previously dropped.
-        return current
-
-    if isinstance(event, ipc.SourceLostEvent):
-        src = current["sources"][event.source]
-        # Idempotency: the first loss is the one that matters. If the binary
-        # ever re-emits source_lost for an already-lost source, ignore it so
-        # we don't overwrite lost_at or duplicate the warning entry.
-        if src.get("status") == "lost":
-            return current
-        src["status"] = "lost"
-        src["lost_at"] = now
-        current["warnings"].append(
-            {
-                "timestamp": now,
-                "source": event.source,
-                "message": event.reason,
-                "at_offset_seconds": event.at_offset_seconds,
-            }
+        await asyncio.wait(
+            {stopped_wait, sig_wait},
+            return_when=asyncio.FIRST_COMPLETED,
         )
-        return current
+    finally:
+        for t in (stopped_wait, sig_wait):
+            if not t.done():
+                t.cancel()
 
-    if isinstance(event, ipc.PermissionRequiredEvent):
-        # Surfaced via logs only. The user-facing message is generated by
-        # `record stop` if a denial follows; this event alone is just info.
-        return current
+    final = await session.stop()
 
-    if isinstance(event, ipc.PermissionDeniedEvent):
-        current["permission_denied"] = event.kind
-        current["warnings"].append(
-            {
-                "timestamp": now,
-                "source": None,
-                "message": f"permission denied: {event.kind}",
-            }
-        )
-        return current
-
-    if isinstance(event, ipc.ErrorEvent):
-        current["warnings"].append(
-            {
-                "timestamp": now,
-                "source": None,
-                "message": event.message,
-            }
-        )
-        return current
-
-    if isinstance(event, ipc.StoppedEvent):
-        current["stopped_at"] = now
-        current["duration_seconds"] = event.duration_seconds
-        # Trust the binary's idea of the output path; it should match what we
-        # told it on `start`, but if it ever diverges we want the truth.
-        current["output_path"] = event.output_path
-        return current
-
-    if isinstance(event, ipc.VideoStartedEvent):
-        video = current["sources"]["video"]
-        video["status"] = "attached"
-        video["attached_at"] = now
-        video["display_id"] = event.display_id
-        video["width_px"] = event.width_px
-        video["height_px"] = event.height_px
-        video["fps"] = event.fps
-        return current
-
-    if isinstance(event, ipc.VideoLostEvent):
-        video = current["sources"]["video"]
-        # Idempotency: mirror SourceLostEvent — the first loss is the one that
-        # matters; later duplicates are silently dropped.
-        if video.get("status") == "lost":
-            return current
-        video["status"] = "lost"
-        video["lost_at"] = now
-        current["warnings"].append(
-            {
-                "timestamp": now,
-                "source": "video",
-                "message": event.reason,
-                "at_offset_seconds": event.at_offset_seconds,
-            }
-        )
-        # Offset 0 means video never produced a frame (typically permission
-        # denial), so no `.mp4` exists on disk. Clear the configured path so the
-        # stop summary won't dangle a phantom file name. Mid-capture losses
-        # (offset > 0) keep the path: the partial mp4 was finalized by the
-        # binary and is playable up to the failure point.
-        if event.at_offset_seconds == 0:
-            current["video_output_path"] = None
-        return current
-
-    if isinstance(event, ipc.VideoFileEvent):
-        # Trust the binary's reported path on `video_file`, similar to how
-        # StoppedEvent overrides output_path.
-        current["video_output_path"] = event.path
-        current["video_file_duration_seconds"] = event.duration_seconds
-        return current
-
-    if isinstance(event, ipc.DisplayReconfiguredEvent):
-        current["display_changes"].append(
-            {
-                "timestamp": now,
-                "reason": event.reason,
-                "new_display_id": event.new_display_id,
-                "new_width_px": event.new_width_px,
-                "new_height_px": event.new_height_px,
-            }
-        )
-        return current
-
-    if isinstance(event, ipc.CaptureEndedBySystemEventEvent):
-        # Real summary-writing into orchestrator.log happens in a later slice;
-        # for now we just record the reason so `record stop` can surface it.
-        current["ended_by"] = event.reason
-        return current
-
-    return current
-
-
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
-
-
-def _send_command(proc: subprocess.Popen[str], cmd: ipc.Command) -> None:
-    """Write a single command line to the binary's stdin and flush."""
-    assert proc.stdin is not None
-    line = ipc.serialize_command(cmd) + "\n"
-    try:
-        proc.stdin.write(line)
-        proc.stdin.flush()
-    except (BrokenPipeError, OSError) as exc:
-        # Binary may have already exited (e.g. crashed before we got SIGTERM).
-        _log.warning("command_send_failed", cmd=cmd.cmd, error=str(exc))
-
-
-def _log_event(event: ipc.Event) -> None:
-    """Emit a structlog line for ``event``."""
-    name = event.event
-    payload = event.model_dump(exclude={"event"})
-    if isinstance(event, (ipc.SourceLostEvent, ipc.ErrorEvent, ipc.PermissionDeniedEvent)):
-        _log.warning(name, **payload)
-    else:
-        _log.info(name, **payload)
+    # The session set final=True. If the binary exited abnormally (its read
+    # loop saw no `stopped`), translate that into the legacy exit code so the
+    # spec-001 integration suite continues to see the same signal.
+    if any(
+        isinstance(w, dict) and "abnormally" in (w.get("message") or "")
+        for w in final.get("warnings", [])
+    ):
+        return _EXIT_BINARY_ABNORMAL
+    return _EXIT_OK
 
 
 def run(
@@ -318,227 +134,57 @@ def run(
     channels: int,
     video_output_path: Path | None = None,
 ) -> int:
-    """Main supervisor entry point. Returns the desired process exit code."""
+    """Synchronous entry point used by ``python -m record.supervisor``."""
     configure_logging()
-    paths.ensure_dirs()
-    resolved = paths.resolve_paths()
-
-    binary = _resolve_binary()
-    if binary is None:
-        _log.error("capture_binary_missing")
-        # Persist a minimal final state so `record stop` can surface this.
-        state.write_state(
-            {
-                "pid": os.getpid(),
-                "final": True,
-                "warnings": [
-                    {
-                        "timestamp": _utcnow_iso(),
-                        "source": None,
-                        "message": "capture binary missing or not executable",
-                    }
-                ],
-                "last_event_at": _utcnow_iso(),
-            }
-        )
-        return _EXIT_BINARY_MISSING
+    resolved = paths.ensure_dirs()
 
     _log.info(
         "supervisor_starting",
-        binary=str(binary),
         output_path=str(output_path),
         video_output_path=str(video_output_path) if video_output_path else None,
         pid=os.getpid(),
     )
 
-    # Spawn the Swift binary in its own session so signals delivered to the
-    # supervisor don't propagate by accident.
-    proc = subprocess.Popen(
-        [str(binary)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        start_new_session=True,
-    )
-
-    # Background drainer for stderr -> daemon.log.
-    stderr_thread = threading.Thread(
-        target=_drain_stderr,
-        args=(proc, resolved.daemon_log),
-        name="record-capture-stderr",
-        daemon=True,
-    )
-    stderr_thread.start()
-
-    # Initial state file. The supervisor's own PID is what `record stop`
-    # signals, so that's what we record here. The Swift binary's PID is not
-    # currently reflected.
-    current_state = _initial_state(supervisor_pid=os.getpid())
-    current_state["output_path"] = str(output_path)
-    current_state["video_output_path"] = (
-        str(video_output_path) if video_output_path else None
-    )
-    state.write_state(current_state)
-
-    # Send the `start` command. We do this before reading any events because
-    # the Swift binary's first event (`ready`) is emitted at startup; on the
-    # next event after `ready` we expect `started` to follow our command.
-    #
-    # Video parameters are optional on the wire: when ``video_output_path`` is
-    # ``None`` the field is omitted entirely (see ``ipc.serialize_command``)
-    # and the binary skips video capture. Slice 1 wires the plumbing without
-    # yet rendering any frames.
-    video_config = (
-        ipc.VideoConfig(fps=30, show_cursor=True) if video_output_path else None
-    )
-    _send_command(
-        proc,
-        ipc.StartCommand(
-            output_path=str(output_path),
-            format=ipc.AudioFormat(
+    try:
+        rc = asyncio.run(
+            _run_session(
+                output_path=output_path,
                 sample_rate=sample_rate,
                 bit_depth=bit_depth,
                 channels=channels,
-            ),
-            video_output_path=(
-                str(video_output_path) if video_output_path else None
-            ),
-            video=video_config,
-        ),
-    )
-
-    # SIGTERM handler: forward a `stop` command and let the read loop drain
-    # the remaining events. Using a flag so re-entry is safe.
-    stop_requested = threading.Event()
-
-    def _handle_sigterm(signum: int, frame: Any) -> None:
-        if stop_requested.is_set():
-            return
-        stop_requested.set()
-        _log.info("sigterm_received")
-        _send_command(proc, ipc.StopCommand())
-
-    signal.signal(signal.SIGTERM, _handle_sigterm)
-    signal.signal(signal.SIGINT, _handle_sigterm)
-
-    # Read loop. ``proc.stdout`` is line-buffered in text mode so each
-    # ``readline()`` returns at most one event.
-    assert proc.stdout is not None
-    abnormal = False
-    saw_stopped = False
-
-    while True:
+                video_output_path=video_output_path,
+                daemon_log_path=resolved.daemon_log,
+            )
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.error(
+            "supervisor_crashed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        # Best-effort: leave a final state file behind so `record stop`
+        # (legacy path) doesn't hang on a missing snapshot.
         try:
-            line = proc.stdout.readline()
-        except KeyboardInterrupt:
-            # Treat Ctrl-C as a stop request, then resume reading.
-            _handle_sigterm(signal.SIGINT, None)
-            continue
-
-        if line == "":
-            # EOF — binary closed stdout (clean exit or crash).
-            break
-
-        line = line.rstrip("\n")
-        if not line:
-            continue
-
-        try:
-            event = ipc.parse_event(line)
-        except ValidationError as exc:
-            _log.warning("event_parse_failed", raw=line, error=str(exc))
-            continue
-        except ValueError as exc:
-            _log.warning("event_parse_failed", raw=line, error=str(exc))
-            continue
-
-        _log_event(event)
-        current_state = _apply_event(current_state, event)
-        try:
-            state.write_state(current_state)
-        except OSError as exc:
-            _log.warning("state_write_failed", error=str(exc))
-
-        if isinstance(event, ipc.StoppedEvent):
-            saw_stopped = True
-            # Don't break: keep draining until the binary closes stdout, so
-            # any trailing events (rare) still land in the state file.
-
-    # Reap the binary. Give it a brief grace period in case stopped happened
-    # but exit() hasn't completed yet.
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        _log.warning("binary_did_not_exit_killing")
-        proc.kill()
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+            state.write_state(
+                {
+                    "pid": os.getpid(),
+                    "final": True,
+                    "warnings": [
+                        {
+                            "timestamp": _utcnow_iso(),
+                            "source": None,
+                            "message": f"supervisor crashed: {exc}",
+                        }
+                    ],
+                    "last_event_at": _utcnow_iso(),
+                }
+            )
+        except Exception:
             pass
+        return _EXIT_BINARY_ABNORMAL
 
-    return_code = proc.returncode
-    if not saw_stopped and not stop_requested.is_set():
-        abnormal = True
-        _log.warning(
-            "binary_exited_without_stopped",
-            return_code=return_code,
-        )
-        current_state["warnings"].append(
-            {
-                "timestamp": _utcnow_iso(),
-                "source": None,
-                "message": (
-                    f"supervisor terminated abnormally "
-                    f"(binary exit code {return_code})"
-                ),
-            }
-        )
-
-    # System-event-triggered clean exit: the binary emitted `stopped` on its
-    # own (saw_stopped=True) without us asking (stop_requested is the SIGTERM
-    # flag — a user `record stop` always sets it before the binary stops, so
-    # `not stop_requested.is_set()` is the only reliable way to discriminate
-    # a system-event shutdown from a user-initiated one here), and the binary
-    # already told us which system reason ended the capture via the
-    # `capture_ended_by_system_event` event (see _apply_event).
-    _system_event_reasons = {"system_sleep", "display_sleep", "screen_locked"}
-    ended_by = current_state.get("ended_by")
-    if (
-        saw_stopped
-        and not stop_requested.is_set()
-        and ended_by in _system_event_reasons
-    ):
-        parts = [
-            f"[{_utcnow_iso()}]",
-            "capture ended by system event",
-            f"reason={ended_by}",
-            f"audio={current_state.get('output_path')}",
-        ]
-        video_path = current_state.get("video_output_path")
-        if video_path:
-            parts.append(f"video={video_path}")
-        duration = current_state.get("duration_seconds")
-        if duration is not None:
-            parts.append(f"duration_seconds={duration}")
-        summary_line = " ".join(parts) + "\n"
-        try:
-            resolved.orchestrator_log.parent.mkdir(parents=True, exist_ok=True)
-            with open(resolved.orchestrator_log, "a", encoding="utf-8") as fp:
-                fp.write(summary_line)
-        except OSError as exc:
-            _log.warning("orchestrator_summary_write_failed", error=str(exc))
-
-    current_state["final"] = True
-    current_state["last_event_at"] = _utcnow_iso()
-    try:
-        state.write_state(current_state)
-    except OSError as exc:
-        _log.warning("final_state_write_failed", error=str(exc))
-
-    _log.info("supervisor_exiting", abnormal=abnormal, return_code=return_code)
-    return _EXIT_BINARY_ABNORMAL if abnormal else _EXIT_OK
+    _log.info("supervisor_exiting", return_code=rc)
+    return rc
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +195,7 @@ def run(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="record.supervisor",
-        description="Long-running supervisor for the Swift capture binary.",
+        description="Legacy foreground supervisor for the Swift capture binary.",
     )
     parser.add_argument(
         "--output-path",

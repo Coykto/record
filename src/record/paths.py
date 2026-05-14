@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .config import Config
 
 # Directory names live here so the rest of the orchestrator imports them from a
 # single source of truth.
@@ -126,6 +130,61 @@ def ensure_daemon_dirs() -> None:
     app_support_dir().mkdir(parents=True, exist_ok=True)
 
 
+def resolve_output_folder(config: "Config") -> Path:
+    """Return the configured output folder (already absolute / expanded).
+
+    Spec 003 slice 3: hotkey-driven captures land here instead of CWD.
+    """
+    return config.output_folder
+
+
+def resolve_log_folder(config: "Config") -> Path:
+    """Return the configured log folder."""
+    return config.log_folder
+
+
+def resolve_daemon_log_file(config: "Config") -> Path:
+    """Return ``<log_folder>/daemon.log`` for the resolved config.
+
+    Slice 3 replaces the hard-coded :func:`daemon_log_file` for the daemon
+    path. The hard-coded variant remains the fallback for the foreground
+    ``python -m record.supervisor`` test path.
+    """
+    return config.log_folder / _DAEMON_LOG_FILENAME
+
+
+def ensure_dirs_from_config(config: "Config") -> None:
+    """Create the config-driven output / log folders and the app-support dir.
+
+    Idempotent: each call uses ``parents=True, exist_ok=True``. A collision
+    with a non-directory (e.g. a regular file already at the configured path)
+    surfaces as :class:`ConfigError` with a clear message naming the path —
+    rather than the raw OSError pydantic-settings would otherwise leak.
+    """
+    # Imported here to avoid a top-of-module import cycle: ``config.py``
+    # imports from ``logging_setup`` (which imports ``paths``), so paths
+    # cannot import config at module load.
+    from .config import ConfigError
+
+    for label, path in (
+        ("output_folder", config.output_folder),
+        ("log_folder", config.log_folder),
+    ):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except (NotADirectoryError, FileExistsError) as exc:
+            raise ConfigError(
+                f"{label} {path} exists but is not a directory"
+            ) from exc
+        except OSError as exc:
+            raise ConfigError(
+                f"cannot create {label} {path}: {exc}"
+            ) from exc
+
+    # PID file + control socket live here.
+    app_support_dir().mkdir(parents=True, exist_ok=True)
+
+
 def resolve_paths() -> RecordPaths:
     """Resolve every path in one go and return them as a frozen dataclass."""
     return RecordPaths(
@@ -165,4 +224,8 @@ __all__ = [
     "ensure_daemon_dirs",
     "resolve_paths",
     "ensure_dirs",
+    "resolve_output_folder",
+    "resolve_log_folder",
+    "resolve_daemon_log_file",
+    "ensure_dirs_from_config",
 ]
