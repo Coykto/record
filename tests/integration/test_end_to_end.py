@@ -943,6 +943,249 @@ def test_end_to_end_daemon_driven_start_stop(
 
 
 # ---------------------------------------------------------------------------
+# Spec 004 slice 2 — daemon auto-transcription on finalize
+#
+# Spawns the real ``python -m record.daemon`` subprocess with synthetic Swift
+# capture (same harness the slice-2 daemon-driven test above uses), but points
+# Deepgram-bound HTTP at a localhost stub server via the
+# ``RECORD_DEEPGRAM_ENDPOINT`` test seam. After ``start`` + ``stop``, polls
+# (no ``time.sleep``-based hard wait — uses ``asyncio.wait_for``-style
+# bounded polling) for the three transcript files to materialise next to the
+# recorded ``.wav``.
+# ---------------------------------------------------------------------------
+
+
+import socketserver  # noqa: E402 — placed next to its test usage
+from http.server import BaseHTTPRequestHandler  # noqa: E402
+
+
+# Canned Deepgram response shaped exactly like the slice-1 fixture in
+# ``tests/python/test_transcribe.py``. Inlined here to keep the integration
+# layer dependency-free (the suite's conftest forbids importing ``record.*``).
+_CANNED_DEEPGRAM_RESPONSE: dict = {
+    "metadata": {
+        "duration": 1.5,
+        "channels": 1,
+        "models": ["nova-3"],
+    },
+    "results": {
+        "channels": [
+            {
+                "detected_language": "en",
+                "alternatives": [
+                    {
+                        "transcript": "hello there",
+                        "languages": ["en"],
+                    }
+                ],
+            }
+        ],
+        "utterances": [
+            {
+                "speaker": 0,
+                "start": 0.0,
+                "end": 1.5,
+                "transcript": "hello there",
+            }
+        ],
+    },
+}
+
+
+class _DeepgramStubHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP handler that mimics Deepgram's pre-recorded endpoint."""
+
+    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
+        length = int(self.headers.get("Content-Length", "0"))
+        # Drain the request body so the daemon's POST completes cleanly.
+        if length:
+            self.rfile.read(length)
+        body = json.dumps(_CANNED_DEEPGRAM_RESPONSE).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        # Silence the default stderr access log so the pytest output stays clean.
+        return
+
+
+class _ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def _wait_for_files(
+    paths_to_check: list[Path], *, timeout: float
+) -> bool:
+    """Poll up to ``timeout`` seconds for every path in ``paths_to_check``."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if all(p.exists() for p in paths_to_check):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_end_to_end_daemon_auto_transcription_on_finalize(
+    capture_binary: Path,
+) -> None:
+    """Daemon capture → finalize → background transcription writes 3 files.
+
+    Spawns the real ``record.daemon`` subprocess with synthetic Swift capture
+    and a localhost Deepgram stub. After the capture's ``stop`` resolves, the
+    daemon's spawned transcription task POSTs to the stub, gets the canned
+    response, and writes ``{stem}.json/.txt/.srt`` next to the recorded
+    ``.wav``. The control reply for ``stop`` must not block on this — the
+    files materialise asynchronously, so we poll on a bounded deadline.
+    """
+    # Spin up the Deepgram stub. ``port=0`` lets the OS pick a free port.
+    httpd = _ThreadingHTTPServer(("127.0.0.1", 0), _DeepgramStubHandler)
+    stub_thread = threading.Thread(
+        target=httpd.serve_forever, name="deepgram-stub", daemon=True
+    )
+    stub_thread.start()
+    try:
+        stub_port = httpd.server_address[1]
+        stub_endpoint = f"http://127.0.0.1:{stub_port}/v1/listen"
+
+        # Same sandbox pattern as ``test_end_to_end_daemon_driven_start_stop``.
+        sandbox = Path(tempfile.mkdtemp(prefix="rd-", dir="/tmp"))
+        try:
+            cwd = sandbox / "out"
+            cwd.mkdir()
+            cwd_resolved = cwd.resolve()
+
+            config_dir = sandbox / ".config" / "record"
+            config_dir.mkdir(parents=True)
+            log_dir = sandbox / "logs"
+            log_dir.mkdir()
+            (config_dir / "config.toml").write_text(
+                f'output_folder = "{cwd_resolved}"\n'
+                f'log_folder = "{log_dir.resolve()}"\n',
+                encoding="utf-8",
+            )
+
+            env = dict(os.environ)
+            env["HOME"] = str(sandbox)
+            env["RECORD_CAPTURE_TEST_FLAGS"] = (
+                "--test-silent-sources --test-synthetic-video"
+            )
+            # Slice-1 env-var fallback for the API key (saves a Keychain
+            # mutation from the test); slice-2 test seam for the endpoint.
+            env["RECORD_DEEPGRAM_API_KEY"] = "test-key-not-real"
+            env["RECORD_DEEPGRAM_ENDPOINT"] = stub_endpoint
+
+            daemon_proc = subprocess.Popen(
+                [sys.executable, "-m", "record.daemon"],
+                cwd=str(cwd),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            socket_path = (
+                sandbox
+                / "Library"
+                / "Application Support"
+                / "record"
+                / "daemon.sock"
+            )
+
+            try:
+                if not _wait_for_socket(socket_path, timeout=10.0):
+                    assert daemon_proc.stderr is not None
+                    try:
+                        stderr_dump = daemon_proc.stderr.read() or ""
+                    except Exception:
+                        stderr_dump = ""
+                    pytest.fail(
+                        f"daemon did not bind socket at {socket_path} within 10s; "
+                        f"stderr:\n{stderr_dump}"
+                    )
+
+                # ----- start ---------------------------------------------
+                start_resp = _send_control_request(socket_path, {"op": "start"})
+                assert start_resp["status"] == "ok", start_resp
+                audio_path = Path(start_resp["audio_path"])
+                assert audio_path.parent == cwd_resolved, audio_path
+
+                # Let the synthetic capture produce a beat of real frames.
+                time.sleep(1.5)
+
+                # ----- stop ----------------------------------------------
+                stop_resp = _send_control_request(
+                    socket_path, {"op": "stop"}, timeout=30.0
+                )
+                assert stop_resp["status"] == "ok", stop_resp
+                assert audio_path.exists()
+
+                # ----- wait for the spawned transcription task ---------
+                stem_dir = audio_path.parent
+                base = audio_path.stem
+                json_path = stem_dir / f"{base}.json"
+                txt_path = stem_dir / f"{base}.txt"
+                srt_path = stem_dir / f"{base}.srt"
+
+                got_all = _wait_for_files(
+                    [json_path, txt_path, srt_path], timeout=10.0
+                )
+                assert got_all, (
+                    f"transcript files did not materialise within 10s; "
+                    f"dir contents: {sorted(p.name for p in stem_dir.iterdir())!r}"
+                )
+
+                # Sanity-check the .json content. The stub's canned utterance
+                # carries "hello there" as the lone segment's text.
+                payload = json.loads(json_path.read_text(encoding="utf-8"))
+                assert payload["provider"] == "deepgram"
+                assert payload["model"] == "nova-3"
+                assert len(payload["segments"]) == 1
+                assert payload["segments"][0]["text"] == "hello there"
+                assert payload["segments"][0]["speaker"] == "Speaker 1"
+
+                # ----- quit ---------------------------------------------
+                quit_resp = _send_control_request(socket_path, {"op": "quit"})
+                assert quit_resp["status"] == "ok"
+                try:
+                    daemon_proc.wait(timeout=10.0)
+                except subprocess.TimeoutExpired:
+                    pytest.fail("daemon did not exit within 10s after quit")
+                assert daemon_proc.returncode == 0, (
+                    f"daemon exited with code {daemon_proc.returncode}"
+                )
+            finally:
+                if daemon_proc.poll() is None:
+                    try:
+                        daemon_proc.send_signal(15)  # SIGTERM
+                        daemon_proc.wait(timeout=5.0)
+                    except Exception:
+                        pass
+                if daemon_proc.poll() is None:
+                    try:
+                        daemon_proc.kill()
+                    except Exception:
+                        pass
+                if daemon_proc.stderr is not None:
+                    try:
+                        stderr_dump = daemon_proc.stderr.read() or ""
+                    except Exception:
+                        stderr_dump = ""
+                    if stderr_dump:
+                        print(f"record.daemon stderr:\n{stderr_dump}")
+        finally:
+            shutil.rmtree(sandbox, ignore_errors=True)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        stub_thread.join(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
 # Slice 4 — 3 back-to-back captures driven by one long-lived Swift child
 #
 # Verifies that the daemon spawns a single ``record-capture --daemon`` child

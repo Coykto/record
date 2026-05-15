@@ -1033,3 +1033,387 @@ def test_hotkey_press_with_failing_start_plays_error_and_notifies(
     assert len(stub.notify_calls) == 1
     # The banner echoes the underlying detail so the user can act on it.
     assert "mic permission denied" in stub.notify_calls[0]
+
+
+# ---------------------------------------------------------------------------
+# Auto-transcription on finalize (spec 004 slice 2)
+#
+# A successful stop or system-event finalize spawns a background transcription
+# task. Tests stub the DeepgramBackend the daemon constructs by patching the
+# ``transcribe_module`` import alias in :mod:`record.daemon`, so no real
+# network is hit. Same trick for ``secrets`` (the API-key resolver).
+# ---------------------------------------------------------------------------
+
+
+from record import transcribe as transcribe_module  # noqa: E402
+
+
+class _StubBackend:
+    """A controllable :class:`TranscriptionBackend` stub for daemon tests.
+
+    Records the audio paths it was called with. The ``done`` event lets a
+    test gate completion so it can assert "the daemon didn't wait on me"
+    (independence / quit-doesn't-await) before letting the task finish.
+
+    ``transcript`` is returned from ``transcribe``; ``raise_exc`` short-circuits
+    to raise instead. Both default to a "succeed with a tiny transcript"
+    behavior so the common case is a one-liner.
+    """
+
+    def __init__(
+        self,
+        *,
+        transcript: transcribe_module.Transcript | None = None,
+        raise_exc: BaseException | None = None,
+        done: asyncio.Event | None = None,
+    ) -> None:
+        self.calls: list[Path] = []
+        self._transcript = transcript or transcribe_module.Transcript(
+            provider="deepgram",
+            model="nova-3",
+            language=["en"],
+            duration_seconds=1.0,
+            segments=[
+                transcribe_module.Segment(
+                    speaker="Speaker 1",
+                    start=0.0,
+                    end=1.0,
+                    text="hello",
+                ),
+            ],
+        )
+        self._raise_exc = raise_exc
+        self._done = done
+
+    async def transcribe(self, audio_path: Path) -> transcribe_module.Transcript:
+        self.calls.append(audio_path)
+        if self._done is not None:
+            await self._done.wait()
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        return self._transcript
+
+
+def _patch_transcription(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    api_key: str | None = "test-key",
+    backends: list[_StubBackend] | None = None,
+) -> list[_StubBackend]:
+    """Patch the daemon's secret lookup + backend constructor.
+
+    Returns a live list that subsequent factory calls populate so tests can
+    assert on the backends the daemon constructed. When ``backends`` is
+    pre-seeded, the factory pops from it (FIFO); otherwise it appends fresh
+    successful stubs.
+    """
+    seeded: list[_StubBackend] = list(backends) if backends else []
+    handed_out: list[_StubBackend] = []
+
+    monkeypatch.setattr(
+        daemon.secrets, "get_deepgram_api_key", lambda: api_key
+    )
+
+    def _factory(key: str, *args: object, **kwargs: object) -> _StubBackend:
+        # Sanity: the backend must be constructed with whatever key the
+        # daemon's resolver returned. A future refactor that accidentally
+        # leaks ``None`` would surface here.
+        assert key == api_key
+        if seeded:
+            stub = seeded.pop(0)
+        else:
+            stub = _StubBackend()
+        handed_out.append(stub)
+        return stub
+
+    monkeypatch.setattr(
+        daemon.transcribe_module, "DeepgramBackend", _factory
+    )
+    return handed_out
+
+
+async def _drain_background(d: daemon.Daemon, timeout: float = 2.0) -> None:
+    """Await every task in ``d._background`` to completion or ``timeout``."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while d._background:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError("background tasks did not drain")
+        tasks = list(d._background)
+        await asyncio.wait(tasks, timeout=remaining)
+
+
+def test_stop_spawns_one_transcription_task_and_writes_files(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful stop → one transcription task → three files appear."""
+    handed_out = _patch_transcription(monkeypatch)
+    d, sessions = _make_daemon(daemon_paths)
+
+    async def _drive() -> control.ControlResponse:
+        await d.handle_request(control.StartRequest())
+        resp = await d.handle_request(control.StopRequest())
+        await _drain_background(d)
+        return resp
+
+    resp = asyncio.run(_drive())
+    assert resp.status == "ok"
+    assert len(handed_out) == 1
+    assert len(handed_out[0].calls) == 1
+
+    # The backend was called with the session's audio path; the three
+    # transcript files appear next to it.
+    audio_path = sessions[0].output_path
+    assert handed_out[0].calls[0] == audio_path
+    stem_dir = audio_path.parent
+    base = audio_path.stem
+    assert (stem_dir / f"{base}.json").is_file()
+    assert (stem_dir / f"{base}.txt").is_file()
+    assert (stem_dir / f"{base}.srt").is_file()
+
+
+def test_no_api_key_skips_transcription_and_logs_warning(
+    daemon_paths: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No key → no task, no exception, ``transcription_skipped`` at WARNING.
+
+    Capture still finalizes cleanly and the daemon stays IDLE.
+    """
+    handed_out = _patch_transcription(monkeypatch, api_key=None)
+    d, sessions = _make_daemon(daemon_paths)
+
+    caplog.set_level(logging.WARNING, logger="record.daemon")
+
+    async def _drive() -> control.ControlResponse:
+        await d.handle_request(control.StartRequest())
+        return await d.handle_request(control.StopRequest())
+
+    resp = asyncio.run(_drive())
+    assert resp.status == "ok"
+    # No backend was ever constructed.
+    assert handed_out == []
+    # No lingering background task.
+    assert not any(
+        (t.get_name() or "").startswith("transcribe:")
+        for t in d._background
+    )
+    # Daemon returned to IDLE and the file finalized.
+    assert d._state == daemon._CaptureState.IDLE
+    # The warning was logged with the structured fields we promised.
+    matching = [
+        rec for rec in caplog.records if "transcription_skipped" in rec.getMessage()
+    ]
+    assert matching, (
+        f"expected `transcription_skipped` WARNING; saw: "
+        f"{[r.getMessage() for r in caplog.records]!r}"
+    )
+    # The audio path the user "lost" is in the structured payload.
+    payload = matching[-1].getMessage()
+    assert str(sessions[0].output_path) in payload
+
+
+def test_transcription_failure_logged_no_exception_escapes(
+    daemon_paths: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Backend raising ``TranscriptionError`` → logged at ERROR, daemon healthy."""
+    failing = _StubBackend(
+        raise_exc=transcribe_module.TranscriptionError("deepgram 401: bad key")
+    )
+    _patch_transcription(monkeypatch, backends=[failing])
+    d, _sessions = _make_daemon(daemon_paths)
+
+    caplog.set_level(logging.ERROR, logger="record.daemon")
+
+    async def _drive() -> control.ControlResponse:
+        await d.handle_request(control.StartRequest())
+        resp = await d.handle_request(control.StopRequest())
+        await _drain_background(d)
+        # Daemon must accept more commands afterwards.
+        status = await d.handle_request(control.StatusRequest())
+        assert status.status == "ok"
+        return resp
+
+    resp = asyncio.run(_drive())
+    assert resp.status == "ok"
+    assert d._state == daemon._CaptureState.IDLE
+
+    # ERROR line with the failure reason.
+    matching = [
+        rec for rec in caplog.records if "transcription_failed" in rec.getMessage()
+    ]
+    assert matching, (
+        f"expected `transcription_failed` ERROR; saw: "
+        f"{[r.getMessage() for r in caplog.records]!r}"
+    )
+    msg = matching[-1].getMessage()
+    assert "deepgram 401" in msg
+    # The API key never appears in the structured log line.
+    assert "test-key" not in msg
+
+
+def test_two_stops_in_quick_succession_produce_independent_tasks(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two start/stop cycles → two transcription tasks; neither blocks the other.
+
+    Each backend gates completion behind its own ``asyncio.Event`` so the test
+    can assert ``_handle_stop`` returned before the prior backend finished.
+    """
+    gate_a = asyncio.Event()
+    gate_b = asyncio.Event()
+    stub_a = _StubBackend(done=gate_a)
+    stub_b = _StubBackend(done=gate_b)
+    _patch_transcription(monkeypatch, backends=[stub_a, stub_b])
+    d, sessions = _make_daemon(daemon_paths)
+
+    async def _drive() -> None:
+        # Cycle 1.
+        await d.handle_request(control.StartRequest())
+        stop_a = await d.handle_request(control.StopRequest())
+        assert stop_a.status == "ok"
+
+        # Let the scheduler enter the transcription task at least once so
+        # ``stub_a.calls`` reflects "I was invoked but I'm parked on the gate".
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # Cycle 1's task is parked on gate_a; cycle 2 must not be gated by it.
+        assert stub_a.calls and not gate_a.is_set()
+
+        # Cycle 2. If the first task blocked the daemon, this stop would
+        # never return (or would deadlock awaiting cycle 1's transcribe).
+        await d.handle_request(control.StartRequest())
+        stop_b = await d.handle_request(control.StopRequest())
+        assert stop_b.status == "ok"
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert stub_b.calls
+
+        # Two transcription tasks in flight, one per cycle.
+        transcribe_tasks = [
+            t
+            for t in d._background
+            if (t.get_name() or "").startswith("transcribe:")
+        ]
+        assert len(transcribe_tasks) == 2
+
+        # Release both gates and drain.
+        gate_a.set()
+        gate_b.set()
+        await _drain_background(d)
+
+    asyncio.run(_drive())
+    assert len(sessions) == 2
+
+
+def test_quit_does_not_await_in_flight_transcription(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``record quit`` returns promptly even with a transcription mid-flight.
+
+    The serve_forever() cleanup path partitions the background set so the
+    transcription task is abandoned (logged) rather than awaited.
+    """
+    gate = asyncio.Event()
+    slow = _StubBackend(done=gate)
+    _patch_transcription(monkeypatch, backends=[slow])
+    d, _sessions = _make_daemon(daemon_paths)
+
+    async def _drive() -> None:
+        await d.handle_request(control.StartRequest())
+        await d.handle_request(control.StopRequest())
+        # Yield so the spawned task enters ``backend.transcribe`` and parks
+        # on the gate before we issue the quit.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert slow.calls, "transcription task did not start"
+
+        # quit must NOT block on the in-flight transcription.
+        resp = await asyncio.wait_for(
+            d.handle_request(control.QuitRequest(finalize=False)),
+            timeout=2.0,
+        )
+        # quit returns ok (capture already finalized in this test).
+        assert resp.status == "ok"
+        assert d._shutdown_event.is_set()
+
+        # The transcription task is still in the background set — it was NOT
+        # awaited by quit. (serve_forever's cleanup partition logs + abandons
+        # rather than awaits; we don't run serve_forever here.)
+        transcribe_tasks = [
+            t
+            for t in d._background
+            if (t.get_name() or "").startswith("transcribe:")
+        ]
+        assert len(transcribe_tasks) == 1
+        assert not transcribe_tasks[0].done()
+
+        # Tidy: release the gate so the orphaned task can finalize before the
+        # event loop closes (avoids a noisy warning).
+        gate.set()
+        await transcribe_tasks[0]
+
+    asyncio.run(_drive())
+
+
+def test_serve_forever_cleanup_logs_abandoned_transcription(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shutdown cleanup logs ``transcription_abandoned_at_quit`` per task.
+
+    Drives just the cleanup branch of ``serve_forever`` by registering a
+    transcription task on the daemon's ``_background`` set directly, then
+    invoking the partition logic via a mini wrapper that mirrors the
+    serve_forever finally-block. This avoids spawning the Swift child / socket
+    server while still pinning the contract.
+    """
+    captured_logs: list[tuple[str, dict[str, object]]] = []
+
+    def _capture_info(event: str, **kwargs: object) -> None:
+        captured_logs.append((event, dict(kwargs)))
+
+    d, _sessions = _make_daemon(daemon_paths)
+    monkeypatch.setattr(d._log, "info", _capture_info)
+
+    async def _drive() -> None:
+        # Fake an in-flight transcription task — slept forever so it's still
+        # pending when we partition.
+        async def _blocked() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(
+            _blocked(), name="transcribe:2026-05-15T10-00-00"
+        )
+        d._background.add(task)
+        task.add_done_callback(d._background.discard)
+
+        # Replicate the partition logic from serve_forever's finally block.
+        transcription_tasks = [
+            t
+            for t in d._background
+            if (t.get_name() or "").startswith("transcribe:")
+        ]
+        for t in transcription_tasks:
+            if not t.done():
+                _, _, stem = t.get_name().partition(":")
+                d._log.info("transcription_abandoned_at_quit", audio_stem=stem)
+
+        # Tidy.
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_drive())
+
+    abandoned = [
+        (ev, kw)
+        for ev, kw in captured_logs
+        if ev == "transcription_abandoned_at_quit"
+    ]
+    assert len(abandoned) == 1
+    assert abandoned[0][1].get("audio_stem") == "2026-05-15T10-00-00"

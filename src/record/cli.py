@@ -18,6 +18,7 @@ entry-point remains intact for the integration suite and offline use.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import signal
 import subprocess
@@ -31,7 +32,9 @@ from typing import Any
 import typer
 
 from . import config as config_module
-from . import capture, control, ipc, launchagent, paths, state
+from . import capture, control, ipc, launchagent, paths, secrets, state
+from . import transcribe as transcribe_module
+from .logging_setup import get_logger
 
 app = typer.Typer(help="record: privacy-first meeting recorder")
 
@@ -621,6 +624,87 @@ def uninstall() -> None:
         typer.echo("already not registered")
     else:
         typer.echo("removed from login items; daemon stopped")
+
+
+# ---------------------------------------------------------------------------
+# `record transcribe` — spec 004 slice 1
+# ---------------------------------------------------------------------------
+
+
+def _resolve_wav_path(recording: Path) -> Path | None:
+    """Resolve a user-supplied ``recording`` arg to an existing ``.wav`` path.
+
+    Accepts either the ``.wav`` itself or its stem (the path with no suffix, or
+    any other suffix). Returns the resolved ``.wav`` path if it exists on disk,
+    otherwise ``None``.
+    """
+    candidate = recording if recording.suffix == ".wav" else recording.with_suffix(
+        ".wav"
+    )
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+@app.command()
+def transcribe(
+    recording: Path = typer.Argument(
+        ...,
+        help="Path to a recording .wav (or its stem).",
+    ),
+) -> None:
+    """Transcribe a recording's audio into speaker-attributed transcript files.
+
+    Resolves ``recording`` to its ``.wav``, runs the Deepgram backend
+    synchronously, and writes ``{stem}.json`` / ``{stem}.txt`` / ``{stem}.srt``
+    next to it (overwriting any existing ones).
+
+    Exit codes:
+      * 0 — transcription succeeded; three files written.
+      * 1 — the ``.wav`` file was not found.
+      * 2 — no Deepgram API key configured.
+      * 3 — transcription failed (reason printed to stderr and logged).
+    """
+    log = get_logger("record.cli")
+
+    wav_path = _resolve_wav_path(recording)
+    if wav_path is None:
+        typer.echo(f"recording not found: {recording}", err=True)
+        raise typer.Exit(code=1)
+
+    api_key = secrets.get_deepgram_api_key()
+    if api_key is None:
+        typer.echo(
+            "no Deepgram API key configured — set RECORD_DEEPGRAM_API_KEY or "
+            "run `record install` to store one",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    backend = transcribe_module.DeepgramBackend(api_key)
+    try:
+        transcript = asyncio.run(backend.transcribe(wav_path))
+        written = transcribe_module.write_transcript(transcript, wav_path)
+    except transcribe_module.TranscriptionError as exc:
+        log.error("transcription_failed", recording=str(wav_path), reason=str(exc))
+        typer.echo(f"transcription failed: {exc}", err=True)
+        raise typer.Exit(code=3) from None
+    except Exception as exc:  # unexpected — still fail cleanly, no stack trace.
+        log.error(
+            "transcription_failed",
+            recording=str(wav_path),
+            reason=str(exc),
+            unexpected=True,
+        )
+        typer.echo(f"transcription failed: {exc}", err=True)
+        raise typer.Exit(code=3) from None
+
+    languages = ", ".join(transcript.language) if transcript.language else "unknown"
+    typer.echo(
+        f"transcribed {wav_path.name}: {len(transcript.segments)} segments, "
+        f"language {languages} -> {written[0].name}, {written[1].name}, "
+        f"{written[2].name}"
+    )
 
 
 # ---------------------------------------------------------------------------

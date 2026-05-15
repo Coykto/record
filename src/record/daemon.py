@@ -28,7 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config as config_module
-from . import control, feedback, ipc, launchagent, paths, state
+from . import control, feedback, ipc, launchagent, paths, secrets, state
+from . import transcribe as transcribe_module
 from .capture import (
     CaptureFailedToStart,
     CaptureSession,
@@ -377,16 +378,29 @@ class Daemon:
                 return
             self._state = _CaptureState.STOPPING
 
+        finalized_audio: str | None = None
         try:
-            await session.stop()
+            final = await session.stop()
         except Exception as exc:  # pragma: no cover - defensive
             self._log.exception("capture_system_event_stop_failed", error=str(exc))
+            final = None
+        else:
+            audio_value = final.get("output_path") if isinstance(final, dict) else None
+            if isinstance(audio_value, str):
+                finalized_audio = audio_value
 
         async with self._lock:
             self._session = None
             self._state = _CaptureState.IDLE
             self._started_at = None
             self._capture_id = None
+
+        # Spec 004 slice 2: a system-event-driven stop is just as eligible for
+        # auto-transcription as an explicit ``record stop``. Spawn after the
+        # capture has been confirmed finalized and the state has unwound to
+        # IDLE (a transcription failure must never trap the state machine).
+        if finalized_audio is not None:
+            self._spawn_transcription(Path(finalized_audio))
 
     # ----- Hotkey routing (slice 5) ---------------------------------------
 
@@ -654,6 +668,13 @@ class Daemon:
         # RUNNING→IDLE regardless of input channel.
         self._safe_play_stop()
 
+        # Spec 004 slice 2: kick off auto-transcription. Fire-and-forget — the
+        # control reply must not wait on Deepgram. ``_spawn_transcription`` is
+        # safe to call without a configured key (it logs and returns).
+        audio_path_str = final.get("output_path")
+        if isinstance(audio_path_str, str):
+            self._spawn_transcription(Path(audio_path_str))
+
         # Confirm the final state was persisted (CaptureSession set final=True
         # before returning). The CLI re-reads `capture-state.json` to print
         # the same summary the legacy stop did.
@@ -662,6 +683,77 @@ class Daemon:
             audio_path=final.get("output_path"),
             video_path=final.get("video_output_path"),
         )
+
+    # ----- Transcription spawning (spec 004 slice 2) ----------------------
+
+    def _spawn_transcription(self, audio_path: Path) -> None:
+        """Fire off a background transcription job for ``audio_path``.
+
+        Tech spec 004 §2.4: on every successful finalize the daemon launches a
+        detached transcription task. The control reply has already been (or is
+        about to be) returned; this method must not block on Deepgram.
+
+        Behavior:
+        - If no API key is configured, log ``transcription_skipped`` at WARNING
+          and return. Capture already succeeded — the missing key is a quiet
+          configuration outcome, never an error.
+        - Otherwise spawn an ``asyncio.Task`` named ``transcribe:<stem>`` that
+          awaits :meth:`TranscriptionBackend.transcribe` then writes the three
+          transcript files. On any exception, log ``transcription_failed`` at
+          ERROR with ``str(exc)`` (never the API key) and swallow — the daemon
+          must remain healthy. The task is added to ``self._background`` with a
+          done-callback that discards it and consumes any unretrieved
+          exception so asyncio doesn't warn at shutdown.
+        - The task is named ``transcribe:<stem>`` so the shutdown path in
+          :meth:`serve_forever` can partition the background set and avoid
+          awaiting in-flight transcriptions on quit.
+        """
+        api_key = secrets.get_deepgram_api_key()
+        if api_key is None:
+            self._log.warning(
+                "transcription_skipped",
+                audio_path=str(audio_path),
+                reason="no_api_key",
+            )
+            return
+
+        backend = transcribe_module.DeepgramBackend(api_key)
+        stem = audio_path.stem
+
+        async def _run() -> None:
+            # ``stem_path`` is the .wav with its suffix dropped; the writers
+            # append .json/.txt/.srt per their contract.
+            stem_path = audio_path.with_suffix("")
+            try:
+                transcript = await backend.transcribe(audio_path)
+                transcribe_module.write_transcript(transcript, stem_path)
+            except transcribe_module.TranscriptionError as exc:
+                self._log.error(
+                    "transcription_failed",
+                    audio_path=str(audio_path),
+                    reason=str(exc),
+                )
+            except Exception as exc:  # any unexpected failure — log + swallow
+                self._log.error(
+                    "transcription_failed",
+                    audio_path=str(audio_path),
+                    reason=str(exc),
+                    error_type=type(exc).__name__,
+                )
+
+        task = asyncio.create_task(_run(), name=f"transcribe:{stem}")
+        self._background.add(task)
+
+        def _done(t: asyncio.Task[None]) -> None:
+            self._background.discard(t)
+            # Consume any unretrieved exception so asyncio doesn't warn — _run
+            # already swallows internally, but a future refactor could leak.
+            try:
+                t.exception()
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                pass
+
+        task.add_done_callback(_done)
 
     def _probe_autostart_registered(self) -> bool:
         """Best-effort ``launchctl print`` probe; never raises."""
@@ -810,11 +902,41 @@ class Daemon:
                 except Exception:  # pragma: no cover - defensive
                     self._log.exception("shutdown_stop_failed")
 
-            # Cancel any lingering background tasks.
+            # Partition background tasks. Spec 004 tech spec §2.4 + risk row:
+            # in-flight transcription jobs are abandoned at quit time, not
+            # awaited — a slow Deepgram call must not gate a ``record quit``.
+            # Other background tasks (the system-event watcher) are awaited
+            # as before so the finalize bookkeeping completes cleanly.
+            transcription_tasks: list[asyncio.Task[None]] = []
+            other_tasks: list[asyncio.Task[None]] = []
             for task in list(self._background):
+                if (task.get_name() or "").startswith("transcribe:"):
+                    transcription_tasks.append(task)
+                else:
+                    other_tasks.append(task)
+
+            # Log + abandon transcription tasks. We do NOT cancel them: if the
+            # loop happens to run them to completion before the process exits,
+            # the user gets the transcript files for free. If it doesn't,
+            # they're orphaned silently per the functional spec (no retry).
+            for task in transcription_tasks:
+                if not task.done():
+                    name = task.get_name()
+                    # Name is ``transcribe:<stem>``; surface the stem so the
+                    # log line names the audio the user lost.
+                    _, _, stem = name.partition(":")
+                    self._log.info(
+                        "transcription_abandoned_at_quit",
+                        audio_stem=stem,
+                    )
+
+            # Cancel any lingering non-transcription background tasks (the
+            # system-event watcher) and await them so finalize bookkeeping
+            # finishes before the server closes.
+            for task in other_tasks:
                 if not task.done():
                     task.cancel()
-            for task in list(self._background):
+            for task in other_tasks:
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):

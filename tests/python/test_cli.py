@@ -23,6 +23,7 @@ from typer.testing import CliRunner
 
 from record import cli, control, launchagent, paths, state
 from record.config import Config
+from record.transcribe import Segment, Transcript, TranscriptionError
 
 
 runner = CliRunner()
@@ -1025,3 +1026,107 @@ def test_status_when_daemon_unreachable_probes_autostart(
         assert "autostart: registered" in result.stdout
     finally:
         launchagent.set_launchctl_runner(None)
+
+
+# ---------------------------------------------------------------------------
+# `record transcribe` — spec 004 slice 1
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_backend_factory(
+    *,
+    transcript: Transcript | None = None,
+    error: Exception | None = None,
+) -> type:
+    """Build a stand-in for :class:`DeepgramBackend` that captures init args
+    and either returns a canned ``Transcript`` or raises an exception when
+    ``transcribe`` is awaited.
+    """
+
+    class _FakeBackend:
+        last_api_key: str | None = None
+
+        def __init__(self, api_key: str, *, client: Any = None) -> None:
+            type(self).last_api_key = api_key
+
+        async def transcribe(self, wav_path: Path) -> Transcript:
+            if error is not None:
+                raise error
+            assert transcript is not None
+            return transcript
+
+    return _FakeBackend
+
+
+def test_transcribe_exit_1_file_not_found(tmp_path: Path) -> None:
+    missing = tmp_path / "nope.wav"
+    result = runner.invoke(cli.app, ["transcribe", str(missing)])
+    assert result.exit_code == 1
+    assert "recording not found" in result.stderr
+
+
+def test_transcribe_exit_2_no_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wav_path = tmp_path / "rec.wav"
+    wav_path.write_bytes(b"RIFF....WAVEfmt ")
+
+    monkeypatch.delenv("RECORD_DEEPGRAM_API_KEY", raising=False)
+    monkeypatch.setattr(cli.secrets, "get_deepgram_api_key", lambda: None)
+
+    result = runner.invoke(cli.app, ["transcribe", str(wav_path)])
+    assert result.exit_code == 2
+    assert "Deepgram API key" in result.stderr
+
+
+def test_transcribe_exit_3_transcription_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wav_path = tmp_path / "rec.wav"
+    wav_path.write_bytes(b"RIFF....WAVEfmt ")
+
+    monkeypatch.setattr(cli.secrets, "get_deepgram_api_key", lambda: "fake-key")
+    fake_backend = _make_fake_backend_factory(
+        error=TranscriptionError("network unavailable")
+    )
+    monkeypatch.setattr(cli.transcribe_module, "DeepgramBackend", fake_backend)
+
+    result = runner.invoke(cli.app, ["transcribe", str(wav_path)])
+    assert result.exit_code == 3
+    assert "transcription failed" in result.stderr
+    assert "network unavailable" in result.stderr
+
+
+def test_transcribe_exit_0_happy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wav_path = tmp_path / "2026-05-14T10-00-00.wav"
+    wav_path.write_bytes(b"RIFF....WAVEfmt ")
+
+    transcript = Transcript(
+        provider="deepgram",
+        model="nova-3",
+        language=["en"],
+        duration_seconds=1.0,
+        segments=[
+            Segment(speaker="Speaker 1", start=0.0, end=1.0, text="hi"),
+        ],
+    )
+
+    monkeypatch.setattr(cli.secrets, "get_deepgram_api_key", lambda: "fake-key")
+    fake_backend = _make_fake_backend_factory(transcript=transcript)
+    monkeypatch.setattr(cli.transcribe_module, "DeepgramBackend", fake_backend)
+
+    result = runner.invoke(cli.app, ["transcribe", str(wav_path)])
+    assert result.exit_code == 0, result.stderr
+
+    json_path = tmp_path / "2026-05-14T10-00-00.json"
+    txt_path = tmp_path / "2026-05-14T10-00-00.txt"
+    srt_path = tmp_path / "2026-05-14T10-00-00.srt"
+    assert json_path.is_file()
+    assert txt_path.is_file()
+    assert srt_path.is_file()
+
+    assert "transcribed" in result.stdout
+    assert wav_path.name in result.stdout
+    assert "1 segments" in result.stdout
