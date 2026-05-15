@@ -972,6 +972,78 @@ def test_install_failure_surfaces_launchctl_stderr(
     assert "install failed" in result.stderr
 
 
+def test_install_stores_provided_deepgram_key(
+    install_sandbox: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_sandbox["pid"].parent.mkdir(parents=True, exist_ok=True)
+    install_sandbox["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    launchagent.set_launchctl_runner(_make_runner_stub())
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        cli.secrets, "set_deepgram_api_key", lambda key: calls.append(key)
+    )
+
+    result = runner.invoke(cli.app, ["install"], input="sk-test-key-12345\n")
+    assert result.exit_code == 0, result.stderr
+    assert calls == ["sk-test-key-12345"]
+    assert "sk-test-key-12345" not in result.stdout
+    assert "sk-test-key-12345" not in result.stderr
+    assert "stored" in result.stdout
+
+
+def test_install_blank_key_clears_existing_key(
+    install_sandbox: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_sandbox["pid"].parent.mkdir(parents=True, exist_ok=True)
+    install_sandbox["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    launchagent.set_launchctl_runner(_make_runner_stub())
+
+    set_calls: list[str] = []
+    delete_calls: list[None] = []
+    monkeypatch.setattr(
+        cli.secrets, "set_deepgram_api_key", lambda key: set_calls.append(key)
+    )
+    monkeypatch.setattr(
+        cli.secrets, "delete_deepgram_api_key", lambda: delete_calls.append(None)
+    )
+
+    result = runner.invoke(cli.app, ["install"], input="\n")
+    assert result.exit_code == 0, result.stderr
+    assert len(set_calls) == 0
+    assert len(delete_calls) == 1
+    assert "disabled" in result.stdout
+
+
+def test_install_whitespace_only_key_clears_existing_key(
+    install_sandbox: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_sandbox["pid"].parent.mkdir(parents=True, exist_ok=True)
+    install_sandbox["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    launchagent.set_launchctl_runner(_make_runner_stub())
+
+    set_calls: list[str] = []
+    delete_calls: list[None] = []
+    monkeypatch.setattr(
+        cli.secrets, "set_deepgram_api_key", lambda key: set_calls.append(key)
+    )
+    monkeypatch.setattr(
+        cli.secrets, "delete_deepgram_api_key", lambda: delete_calls.append(None)
+    )
+
+    result = runner.invoke(cli.app, ["install"], input="   \n")
+    assert result.exit_code == 0, result.stderr
+    assert len(set_calls) == 0
+    assert len(delete_calls) == 1
+    assert "disabled" in result.stdout
+
+
 def test_uninstall_happy_path(
     install_sandbox: dict[str, Path],
 ) -> None:

@@ -66,10 +66,32 @@ def set_deepgram_api_key(key: str) -> None:
     keyring.set_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key)
 
 
+def delete_deepgram_api_key() -> None:
+    """Remove the stored Deepgram API key from the macOS Keychain, if any.
+
+    Idempotent: a missing item is not an error. Called from ``record install``
+    when the user wants to turn transcription off — leaving an empty prompt
+    response clears the prior key rather than preserving it, so the daemon's
+    ``transcription_skipped`` path takes over on the next capture finalize.
+
+    A broken/unavailable Keychain backend is swallowed for the same reason
+    :func:`get_deepgram_api_key` swallows it: the orchestrator should not
+    crash because the Keychain hiccupped.
+    """
+    try:
+        keyring.delete_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+    except keyring.errors.PasswordDeleteError:
+        # No item to delete — fine, the post-condition (no key stored) holds.
+        pass
+    except keyring.errors.KeyringError:
+        pass
+
+
 __all__ = [
     "ENV_VAR",
     "KEYCHAIN_ACCOUNT",
     "KEYCHAIN_SERVICE",
+    "delete_deepgram_api_key",
     "get_deepgram_api_key",
     "set_deepgram_api_key",
 ]

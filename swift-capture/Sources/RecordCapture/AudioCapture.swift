@@ -223,9 +223,22 @@ final class AudioCapture: NSObject {
             return
         }
 
-        // Mic first: cheaper to bring up and gives the user audible feedback
-        // sooner if they're testing the pipeline.
-        try startMic()
+        // Mic is best-effort. AVAudioEngine can fail transiently
+        // (`kAudioUnitErr_FormatNotSupported` = -10868) right after the
+        // previous capture's teardown, or while a Bluetooth route is still
+        // transitioning. We surface the failure as an `error` event and
+        // continue with system audio only rather than aborting the entire
+        // session.
+        do {
+            try startMic()
+        } catch {
+            // Mark mic lost so a subsequent route-change notification can't
+            // try to bring it back up against the same broken engine.
+            markMicLost()
+            emit(.error(
+                message: "mic startup failed, continuing with system audio only: \(error.localizedDescription)"
+            ))
+        }
         try await startSystemAudio()
 
         startedAt = Date()
@@ -339,27 +352,131 @@ final class AudioCapture: NSObject {
             micConverterInputFormat = inputFormat
         } // else: built lazily in handleMicBuffer once we see a real format.
 
-        engine.prepare()
-        try engine.start()
+        try startEngineWithRetries()
 
-        // Watch for hardware route changes that AVAudioEngine can't recover
-        // from on its own (AirPods disconnect, USB mic unplug). The spec
-        // requires capture to continue with system audio only when this
-        // happens, so we tear down just the mic side and let the mixer pump
-        // keep going — the natural zero-padding in drainAndMix supplies
-        // silence for the missing source.
+        // Watch for hardware route changes (AirPods connect/disconnect, USB
+        // mic plug/unplug, system default input swap). Per Apple's docs the
+        // engine has already stopped itself by the time this fires — we
+        // rebuild the tap against the new input format and restart, which
+        // keeps mic capture alive across the route change. Only if the
+        // rebuild fails do we fall back to declaring the mic lost.
         engineConfigObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: engine,
             queue: .main
         ) { [weak self] _ in
-            self?.handleMicLost(reason: "audio engine configuration changed")
+            self?.handleEngineConfigurationChange()
         }
 
         emit(.sourceAttached(source: .mic))
     }
 
     // MARK: - Source-loss handlers (Slice 5)
+
+    /// Rebuild the mic tap and restart the engine after an
+    /// `AVAudioEngineConfigurationChange`. Apple's documented recovery path
+    /// for route changes: the engine has already stopped itself, the tap is
+    /// invalid, and we need to re-tap against whatever the new input format
+    /// is (different sample rate / channel count after a Bluetooth headset
+    /// becomes the default input, etc.).
+    ///
+    /// Stays silent on the wire — no `source_lost` / `source_attached`
+    /// events — so from the orchestrator's POV the mic is continuously
+    /// attached across the route change. Only if the rebuild itself fails
+    /// (no input device present, `engine.start()` throws) do we fall
+    /// through to `handleMicLost` so the orchestrator records a genuine
+    /// loss.
+    private func handleEngineConfigurationChange() {
+        // If the mic has already been declared lost (or `stop()` has run
+        // and removed this observer's siblings) there is nothing to rebuild.
+        lossLock.lock()
+        let alreadyLost = micLost
+        lossLock.unlock()
+        if alreadyLost {
+            return
+        }
+
+        // Drop the now-invalid tap. Safe to remove even if the underlying
+        // engine state has changed under us.
+        if micTapInstalled {
+            engine.inputNode.removeTap(onBus: 0)
+            micTapInstalled = false
+        }
+
+        let input = engine.inputNode
+        let newFormat = input.outputFormat(forBus: 0)
+
+        // A 0-channel or 0-Hz format means no input device is present (e.g.
+        // headset went away and nothing else replaced it). Declare lost so
+        // the orchestrator log reflects reality rather than spinning trying
+        // to tap a dead bus.
+        guard newFormat.channelCount > 0, newFormat.sampleRate > 0 else {
+            handleMicLost(reason: "no input device after configuration change")
+            return
+        }
+
+        // Force the converter to rebuild against the new input format on the
+        // next buffer. (Without this we'd rely on the equality check in
+        // `convert()` to notice the change — explicit is clearer.)
+        micConverter = nil
+        micConverterInputFormat = nil
+
+        // Reinstall with `nil` so the tap uses the bus's natural format —
+        // matches the original `startMic()` setup.
+        input.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
+            self?.handleMicBuffer(buffer)
+        }
+        micTapInstalled = true
+
+        do {
+            try startEngineWithRetries()
+        } catch {
+            if micTapInstalled {
+                engine.inputNode.removeTap(onBus: 0)
+                micTapInstalled = false
+            }
+            handleMicLost(
+                reason: "audio engine restart failed after configuration change: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    /// Atomically set `micLost = true`. Pulled out of `startSources` so the
+    /// `NSLock` use stays inside a synchronous helper — async functions can't
+    /// hold `NSLock` across suspension points under Swift 6.
+    private func markMicLost() {
+        lossLock.lock()
+        micLost = true
+        lossLock.unlock()
+    }
+
+    /// Call `engine.prepare()` + `engine.start()` with a small retry loop.
+    ///
+    /// AVAudioEngine on macOS can throw `kAudioUnitErr_FormatNotSupported`
+    /// (-10868) on the first start attempt right after the previous engine's
+    /// teardown, or while a Bluetooth audio route is still transitioning to
+    /// or from the AirPods/headset. `engine.reset()` followed by a brief
+    /// pause is the documented recovery — it returns the engine to a known
+    /// state and gives the audio HAL a chance to settle. We try a small
+    /// fixed number of attempts before surfacing the error to the caller.
+    private func startEngineWithRetries() throws {
+        let maxAttempts = 3
+        var lastError: Error?
+        for attempt in 0..<maxAttempts {
+            if attempt > 0 {
+                engine.reset()
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            do {
+                engine.prepare()
+                try engine.start()
+                return
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError ?? AudioCaptureError.bufferFormatUnavailable
+    }
 
     /// Mark the mic as lost, tear down its inputs, and emit one `source_lost`.
     /// Idempotent: only the first call for a given capture does anything.

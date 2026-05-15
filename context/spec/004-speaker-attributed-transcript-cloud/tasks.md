@@ -16,21 +16,21 @@ Goal: a `TranscriptionBackend` interface + `DeepgramBackend`, transcript writers
 
 Goal: when a daemon capture finalizes (explicit `record stop` *or* a system-event stop), the daemon spawns a background transcription task that writes the three files next to the recording. Failures are logged to `orchestrator.log` with no retry and no notification. Overlapping captures transcribe independently; `record stop` still returns immediately.
 
-- [ ] **Slice 2: Daemon auto-transcription on finalize**
-  - [ ] Add `Daemon._spawn_transcription(audio_path)` to `src/record/daemon.py` — resolve a backend (if no key, log `transcription_skipped` at WARNING and return); otherwise create a tracked `asyncio.Task` that awaits `backend.transcribe()` then `write_transcript()`; on `TranscriptionError` or any exception, log `transcription_failed` at ERROR with the reason. Add the task to `self._background` with a discard done-callback. **[Agent: python-backend]**
-  - [ ] Call `_spawn_transcription` at the tail of both `_handle_stop` and `_watch_for_system_event_stop` with the finalized session's audio path. Confirm `_handle_quit` does **not** await in-flight tasks (keeps quit responsive); log any abandoned jobs. **[Agent: python-backend]**
-  - [ ] Extend `tests/python/test_daemon.py` — on successful stop a transcription task is spawned with the session's audio path (backend stubbed); no key → no task spawned + warning logged; a failing task → `transcription_failed` logged, no exception escapes, daemon stays IDLE; two stops in quick succession → two independent tasks, neither blocks. **[Agent: python-backend]**
-  - [ ] Extend `tests/integration/test_end_to_end.py` — daemon capture with a stubbed Deepgram (`httpx` transport returning a canned response): assert the three transcript files appear next to the `.wav` with the right stem once the stub responds. **[Agent: python-backend]**
-  - [ ] **Verification:** `make test` — green. With `RECORD_DEEPGRAM_API_KEY` set: `record daemon start` → `record start` → `record stop` → after a moment `.json`/`.txt`/`.srt` appear next to the `.wav`. Unset the key → capture still works, `orchestrator.log` shows `transcription_skipped`. Disconnect the network and capture again → `transcription_failed` logged, no crash, no notification. **[Agent: python-backend]**
+- [x] **Slice 2: Daemon auto-transcription on finalize**
+  - [x] Add `Daemon._spawn_transcription(audio_path)` to `src/record/daemon.py` — resolve a backend (if no key, log `transcription_skipped` at WARNING and return); otherwise create a tracked `asyncio.Task` that awaits `backend.transcribe()` then `write_transcript()`; on `TranscriptionError` or any exception, log `transcription_failed` at ERROR with the reason. Add the task to `self._background` with a discard done-callback. **[Agent: python-backend]**
+  - [x] Call `_spawn_transcription` at the tail of both `_handle_stop` and `_watch_for_system_event_stop` with the finalized session's audio path. Confirm `_handle_quit` does **not** await in-flight tasks (keeps quit responsive); log any abandoned jobs. **[Agent: python-backend]**
+  - [x] Extend `tests/python/test_daemon.py` — on successful stop a transcription task is spawned with the session's audio path (backend stubbed); no key → no task spawned + warning logged; a failing task → `transcription_failed` logged, no exception escapes, daemon stays IDLE; two stops in quick succession → two independent tasks, neither blocks. **[Agent: python-backend]**
+  - [x] Extend `tests/integration/test_end_to_end.py` — daemon capture with a stubbed Deepgram (`httpx` transport returning a canned response): assert the three transcript files appear next to the `.wav` with the right stem once the stub responds. **[Agent: python-backend]**
+  - [x] **Verification:** `make test` — green. With `RECORD_DEEPGRAM_API_KEY` set: `record daemon start` → `record start` → `record stop` → after a moment `.json`/`.txt`/`.srt` appear next to the `.wav`. Unset the key → capture still works, `orchestrator.log` shows `transcription_skipped`. Disconnect the network and capture again → `transcription_failed` logged, no crash, no notification. **[Agent: python-backend]**
 
 ## Slice 3 — API key setup at install time
 
 Goal: `record install` prompts for the Deepgram API key and stores it in the Keychain, so a fresh user can set up transcription without touching env vars. Blank input leaves any existing key untouched.
 
-- [ ] **Slice 3: `record install` key prompt**
-  - [ ] Extend `record install` in `src/record/cli.py` — after the existing LaunchAgent registration, prompt `Deepgram API key (leave blank to skip):`. Non-blank → store via `secrets.set_deepgram_api_key`. Blank → skip, leaving any existing key untouched. Input never echoed back. **[Agent: python-backend]**
-  - [ ] Extend `tests/python/test_cli.py` — `install` stores a provided key; blank input leaves an existing key untouched; the key is never printed. **[Agent: python-backend]**
-  - [ ] **Verification:** Run `record install`, enter a key → `record transcribe <fixture>.wav` works with no env var set (key resolved from Keychain). Re-run `record install`, leave the prompt blank → the previously stored key still works. **[Agent: python-backend]**
+- [x] **Slice 3: `record install` key prompt**
+  - [x] Extend `record install` in `src/record/cli.py` — after the existing LaunchAgent registration, prompt `Deepgram API key (leave blank to skip):`. Non-blank → store via `secrets.set_deepgram_api_key`. Blank → skip, leaving any existing key untouched. Input never echoed back. **[Agent: python-backend]**
+  - [x] Extend `tests/python/test_cli.py` — `install` stores a provided key; blank input leaves an existing key untouched; the key is never printed. **[Agent: python-backend]**
+  - [x] **Verification:** Run `record install`, enter a key → `record transcribe <fixture>.wav` works with no env var set (key resolved from Keychain). Re-run `record install`, leave the prompt blank → the previously stored key still works. **[Agent: python-backend]**
 
 ---
 

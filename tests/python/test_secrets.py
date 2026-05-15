@@ -24,13 +24,19 @@ class _MemoryKeyring:
     def set_password(self, service: str, account: str, password: str) -> None:
         self.store[(service, account)] = password
 
+    def delete_password(self, service: str, account: str) -> None:
+        if (service, account) not in self.store:
+            raise keyring.errors.PasswordDeleteError("no such item")
+        del self.store[(service, account)]
+
 
 @pytest.fixture
 def memory_keyring(monkeypatch: pytest.MonkeyPatch) -> _MemoryKeyring:
-    """Replace ``keyring.get_password`` / ``set_password`` with an in-memory map."""
+    """Replace ``keyring.get_password`` / ``set_password`` / ``delete_password`` with an in-memory map."""
     backend = _MemoryKeyring()
     monkeypatch.setattr(secrets.keyring, "get_password", backend.get_password)
     monkeypatch.setattr(secrets.keyring, "set_password", backend.set_password)
+    monkeypatch.setattr(secrets.keyring, "delete_password", backend.delete_password)
     return backend
 
 
@@ -104,3 +110,33 @@ def test_keyring_error_is_swallowed_as_no_key(
 
     monkeypatch.setattr(secrets.keyring, "get_password", _boom)
     assert secrets.get_deepgram_api_key() is None
+
+
+def test_delete_deepgram_api_key_removes_stored_key(
+    memory_keyring: _MemoryKeyring,
+) -> None:
+    memory_keyring.store[
+        (secrets.KEYCHAIN_SERVICE, secrets.KEYCHAIN_ACCOUNT)
+    ] = "key-to-delete"
+    secrets.delete_deepgram_api_key()
+    assert (secrets.KEYCHAIN_SERVICE, secrets.KEYCHAIN_ACCOUNT) not in memory_keyring.store
+    assert secrets.get_deepgram_api_key() is None
+
+
+def test_delete_deepgram_api_key_is_idempotent_when_no_key_stored(
+    memory_keyring: _MemoryKeyring,
+) -> None:
+    # No item present — must not raise.
+    secrets.delete_deepgram_api_key()
+    assert secrets.get_deepgram_api_key() is None
+
+
+def test_delete_deepgram_api_key_swallows_keyring_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(service: str, account: str) -> None:
+        raise keyring.errors.KeyringError("backend unavailable")
+
+    monkeypatch.setattr(secrets.keyring, "delete_password", _boom)
+    # Must not raise — same crash-avoidance contract as get_deepgram_api_key.
+    secrets.delete_deepgram_api_key()

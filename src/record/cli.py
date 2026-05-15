@@ -606,6 +606,26 @@ def install() -> None:
     verb = "re-registered" if result.re_registered else "registered"
     typer.echo(f"{verb} to start on login; running now ({pid_str})")
 
+    # Blank input clears any previously stored key — re-running install with an
+    # empty prompt response is how the user turns transcription off without
+    # touching the Keychain by hand. A closed stdin (non-interactive
+    # invocation) is treated as blank rather than aborting the install.
+    try:
+        api_key = typer.prompt(
+            "Deepgram API key (leave blank to disable transcription)",
+            hide_input=True,
+            default="",
+            show_default=False,
+        ).strip()
+    except typer.Abort:
+        api_key = ""
+    if api_key:
+        secrets.set_deepgram_api_key(api_key)
+        typer.echo("Deepgram API key stored.")
+    else:
+        secrets.delete_deepgram_api_key()
+        typer.echo("Transcription disabled; any previously stored Deepgram key was cleared.")
+
 
 @app.command()
 def uninstall() -> None:
