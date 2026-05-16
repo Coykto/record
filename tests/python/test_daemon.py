@@ -251,12 +251,12 @@ class _FakeSession:
     def __init__(
         self,
         *,
-        output_path: Path,
+        basename: Path,
         video_output_path: Path | None = None,
         start_delay: float = 0.0,
         start_raises: BaseException | None = None,
     ) -> None:
-        self.output_path = output_path
+        self.basename = basename
         self.video_output_path = video_output_path
         self._start_delay = start_delay
         self._start_raises = start_raises
@@ -264,11 +264,30 @@ class _FakeSession:
         self.start_calls = 0
         self.stop_calls = 0
         self.stopped_event = asyncio.Event()
+        # Mirror the shape ``capture._initial_state`` produces (spec 005:
+        # per-source ``audio_files`` map under a basename) so ``_handle_stop``
+        # / ``_handle_status`` can read it identically to the real session.
+        mic_path = str(basename) + "-mic.wav"
+        system_path = str(basename) + "-system.wav"
         self._state: dict[str, object] = {
-            "output_path": str(output_path),
+            "basename": str(basename),
             "video_output_path": (
                 str(video_output_path) if video_output_path else None
             ),
+            "audio_files": {
+                "mic": {
+                    "path": mic_path,
+                    "status": "captured_normally",
+                    "duration_seconds": None,
+                    "truncated_at_offset_seconds": None,
+                },
+                "system_audio": {
+                    "path": system_path,
+                    "status": "captured_normally",
+                    "duration_seconds": None,
+                    "truncated_at_offset_seconds": None,
+                },
+            },
         }
 
     @property
@@ -310,13 +329,13 @@ def _make_daemon(
     handed_out: list[_FakeSession] = []
 
     def _factory(
-        output_path: Path, video_output_path: Path | None
+        basename: Path, video_output_path: Path | None
     ) -> _FakeSession:
         if sessions:
             session = sessions.pop(0)
         else:
             session = _FakeSession(
-                output_path=output_path,
+                basename=basename,
                 video_output_path=video_output_path,
             )
         handed_out.append(session)
@@ -419,10 +438,10 @@ def test_concurrent_start_requests_only_one_session_wins(
     """
     # Slow down the first start so the second request races into it.
     slow = _FakeSession(
-        output_path=daemon_paths["root"] / "x.wav",
+        basename=daemon_paths["root"] / "x",
         start_delay=0.1,
     )
-    fast = _FakeSession(output_path=daemon_paths["root"] / "y.wav")
+    fast = _FakeSession(basename=daemon_paths["root"] / "y")
     d, sessions = _make_daemon(daemon_paths, sessions=[slow, fast])
 
     async def _drive() -> list[control.ControlResponse]:
@@ -453,7 +472,7 @@ def test_start_failure_returns_to_idle(
     from record.capture import CaptureFailedToStart
 
     failing = _FakeSession(
-        output_path=daemon_paths["root"] / "x.wav",
+        basename=daemon_paths["root"] / "x",
         start_raises=CaptureFailedToStart("nope"),
     )
     d, _sessions = _make_daemon(daemon_paths, sessions=[failing])
@@ -700,10 +719,10 @@ def test_hotkey_press_during_starting_is_dropped(
     drop branch. Only one session should be constructed in total.
     """
     slow = _FakeSession(
-        output_path=daemon_paths["root"] / "x.wav",
+        basename=daemon_paths["root"] / "x",
         start_delay=0.1,
     )
-    fast = _FakeSession(output_path=daemon_paths["root"] / "y.wav")
+    fast = _FakeSession(basename=daemon_paths["root"] / "y")
     d, sessions = _make_daemon(daemon_paths, sessions=[slow, fast])
 
     async def _drive() -> None:
@@ -909,10 +928,10 @@ def test_hotkey_press_during_transition_plays_error_and_notifies(
     """
     stub = _install_feedback_stub(monkeypatch)
     slow = _FakeSession(
-        output_path=daemon_paths["root"] / "x.wav",
+        basename=daemon_paths["root"] / "x",
         start_delay=0.1,
     )
-    fast = _FakeSession(output_path=daemon_paths["root"] / "y.wav")
+    fast = _FakeSession(basename=daemon_paths["root"] / "y")
     d, _sessions = _make_daemon(daemon_paths, sessions=[slow, fast])
 
     async def _drive() -> None:
@@ -1020,7 +1039,7 @@ def test_hotkey_press_with_failing_start_plays_error_and_notifies(
 
     stub = _install_feedback_stub(monkeypatch)
     failing = _FakeSession(
-        output_path=daemon_paths["root"] / "x.wav",
+        basename=daemon_paths["root"] / "x",
         start_raises=CaptureFailedToStart("mic permission denied"),
     )
     d, _sessions = _make_daemon(daemon_paths, sessions=[failing])
@@ -1146,7 +1165,11 @@ async def _drain_background(d: daemon.Daemon, timeout: float = 2.0) -> None:
 def test_stop_spawns_one_transcription_task_and_writes_files(
     daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A successful stop → one transcription task → three files appear."""
+    """A successful stop → one transcription task per finalized WAV.
+
+    Spec 005: capture produces two WAVs (mic + system_audio) so the daemon
+    spawns two backend instances and writes a transcript triple next to each.
+    """
     handed_out = _patch_transcription(monkeypatch)
     d, sessions = _make_daemon(daemon_paths)
 
@@ -1158,18 +1181,32 @@ def test_stop_spawns_one_transcription_task_and_writes_files(
 
     resp = asyncio.run(_drive())
     assert resp.status == "ok"
-    assert len(handed_out) == 1
-    assert len(handed_out[0].calls) == 1
+    # One backend per source: mic + system_audio.
+    assert len(handed_out) == 2
+    for stub in handed_out:
+        assert len(stub.calls) == 1
 
-    # The backend was called with the session's audio path; the three
-    # transcript files appear next to it.
-    audio_path = sessions[0].output_path
-    assert handed_out[0].calls[0] == audio_path
-    stem_dir = audio_path.parent
-    base = audio_path.stem
-    assert (stem_dir / f"{base}.json").is_file()
-    assert (stem_dir / f"{base}.txt").is_file()
-    assert (stem_dir / f"{base}.srt").is_file()
+    # Confirm both WAV paths were transcribed and that the three transcript
+    # files appear next to each one.
+    basename = sessions[0].basename
+    mic_path = Path(str(basename) + "-mic.wav")
+    system_path = Path(str(basename) + "-system.wav")
+    called_paths = {stub.calls[0] for stub in handed_out}
+    assert called_paths == {mic_path, system_path}
+    for audio_path in (mic_path, system_path):
+        stem_dir = audio_path.parent
+        base = audio_path.stem
+        assert (stem_dir / f"{base}.json").is_file()
+        assert (stem_dir / f"{base}.txt").is_file()
+        assert (stem_dir / f"{base}.srt").is_file()
+
+    # ControlResponse round-trip: ``audio_paths`` carries both, ``audio_path``
+    # keeps the mic file as the single-field surface.
+    assert resp.audio_paths == {
+        "mic": str(mic_path),
+        "system_audio": str(system_path),
+    }
+    assert resp.audio_path == str(mic_path)
 
 
 def test_no_api_key_skips_transcription_and_logs_warning(
@@ -1209,9 +1246,12 @@ def test_no_api_key_skips_transcription_and_logs_warning(
         f"expected `transcription_skipped` WARNING; saw: "
         f"{[r.getMessage() for r in caplog.records]!r}"
     )
-    # The audio path the user "lost" is in the structured payload.
-    payload = matching[-1].getMessage()
-    assert str(sessions[0].output_path) in payload
+    # The audio path(s) the user "lost" are in the structured payloads
+    # (one warning per finalized WAV). Spec 005: mic path is sufficient.
+    basename = sessions[0].basename
+    mic_path = str(basename) + "-mic.wav"
+    payloads = " ".join(rec.getMessage() for rec in matching)
+    assert mic_path in payloads
 
 
 def test_transcription_failure_logged_no_exception_escapes(
@@ -1258,16 +1298,24 @@ def test_transcription_failure_logged_no_exception_escapes(
 def test_two_stops_in_quick_succession_produce_independent_tasks(
     daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Two start/stop cycles → two transcription tasks; neither blocks the other.
+    """Two start/stop cycles → independent transcription tasks per cycle.
 
-    Each backend gates completion behind its own ``asyncio.Event`` so the test
-    can assert ``_handle_stop`` returned before the prior backend finished.
+    Spec 005: each cycle finalizes two WAVs (mic + system_audio) so two
+    backends are spawned per cycle (four total). Each backend gates completion
+    behind its own ``asyncio.Event`` so the test can assert ``_handle_stop``
+    returned before the prior cycle's backends finished.
     """
-    gate_a = asyncio.Event()
-    gate_b = asyncio.Event()
-    stub_a = _StubBackend(done=gate_a)
-    stub_b = _StubBackend(done=gate_b)
-    _patch_transcription(monkeypatch, backends=[stub_a, stub_b])
+    gate_a1 = asyncio.Event()
+    gate_a2 = asyncio.Event()
+    gate_b1 = asyncio.Event()
+    gate_b2 = asyncio.Event()
+    stub_a1 = _StubBackend(done=gate_a1)
+    stub_a2 = _StubBackend(done=gate_a2)
+    stub_b1 = _StubBackend(done=gate_b1)
+    stub_b2 = _StubBackend(done=gate_b2)
+    _patch_transcription(
+        monkeypatch, backends=[stub_a1, stub_a2, stub_b1, stub_b2]
+    )
     d, sessions = _make_daemon(daemon_paths)
 
     async def _drive() -> None:
@@ -1276,33 +1324,35 @@ def test_two_stops_in_quick_succession_produce_independent_tasks(
         stop_a = await d.handle_request(control.StopRequest())
         assert stop_a.status == "ok"
 
-        # Let the scheduler enter the transcription task at least once so
-        # ``stub_a.calls`` reflects "I was invoked but I'm parked on the gate".
+        # Let the scheduler enter the transcription tasks at least once so
+        # the stubs' ``.calls`` reflect "I was invoked but I'm parked".
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        # Cycle 1's task is parked on gate_a; cycle 2 must not be gated by it.
-        assert stub_a.calls and not gate_a.is_set()
+        # Cycle 1's tasks are parked on their gates; cycle 2 must not block.
+        assert stub_a1.calls and not gate_a1.is_set()
+        assert stub_a2.calls and not gate_a2.is_set()
 
-        # Cycle 2. If the first task blocked the daemon, this stop would
-        # never return (or would deadlock awaiting cycle 1's transcribe).
+        # Cycle 2. If the first cycle's tasks blocked the daemon, this stop
+        # would never return.
         await d.handle_request(control.StartRequest())
         stop_b = await d.handle_request(control.StopRequest())
         assert stop_b.status == "ok"
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        assert stub_b.calls
+        assert stub_b1.calls
+        assert stub_b2.calls
 
-        # Two transcription tasks in flight, one per cycle.
+        # Four transcription tasks in flight (two per cycle).
         transcribe_tasks = [
             t
             for t in d._background
             if (t.get_name() or "").startswith("transcribe:")
         ]
-        assert len(transcribe_tasks) == 2
+        assert len(transcribe_tasks) == 4
 
-        # Release both gates and drain.
-        gate_a.set()
-        gate_b.set()
+        # Release every gate and drain.
+        for g in (gate_a1, gate_a2, gate_b1, gate_b2):
+            g.set()
         await _drain_background(d)
 
     asyncio.run(_drive())
@@ -1318,20 +1368,24 @@ def test_quit_does_not_await_in_flight_transcription(
     transcription task is abandoned (logged) rather than awaited.
     """
     gate = asyncio.Event()
-    slow = _StubBackend(done=gate)
-    _patch_transcription(monkeypatch, backends=[slow])
+    # Spec 005: two finalized WAVs → two backends/tasks per cycle. Both share
+    # the same gate so the test only needs one ``set()`` to release them.
+    slow_mic = _StubBackend(done=gate)
+    slow_sys = _StubBackend(done=gate)
+    _patch_transcription(monkeypatch, backends=[slow_mic, slow_sys])
     d, _sessions = _make_daemon(daemon_paths)
 
     async def _drive() -> None:
         await d.handle_request(control.StartRequest())
         await d.handle_request(control.StopRequest())
-        # Yield so the spawned task enters ``backend.transcribe`` and parks
+        # Yield so the spawned tasks enter ``backend.transcribe`` and park
         # on the gate before we issue the quit.
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        assert slow.calls, "transcription task did not start"
+        assert slow_mic.calls, "mic transcription task did not start"
+        assert slow_sys.calls, "system transcription task did not start"
 
-        # quit must NOT block on the in-flight transcription.
+        # quit must NOT block on the in-flight transcriptions.
         resp = await asyncio.wait_for(
             d.handle_request(control.QuitRequest(finalize=False)),
             timeout=2.0,
@@ -1340,21 +1394,23 @@ def test_quit_does_not_await_in_flight_transcription(
         assert resp.status == "ok"
         assert d._shutdown_event.is_set()
 
-        # The transcription task is still in the background set — it was NOT
-        # awaited by quit. (serve_forever's cleanup partition logs + abandons
-        # rather than awaits; we don't run serve_forever here.)
+        # The transcription tasks are still in the background set — they were
+        # NOT awaited by quit. (serve_forever's cleanup partition logs +
+        # abandons rather than awaits; we don't run serve_forever here.)
         transcribe_tasks = [
             t
             for t in d._background
             if (t.get_name() or "").startswith("transcribe:")
         ]
-        assert len(transcribe_tasks) == 1
-        assert not transcribe_tasks[0].done()
+        assert len(transcribe_tasks) == 2
+        for t in transcribe_tasks:
+            assert not t.done()
 
-        # Tidy: release the gate so the orphaned task can finalize before the
-        # event loop closes (avoids a noisy warning).
+        # Tidy: release the gate so the orphaned tasks can finalize before
+        # the event loop closes (avoids a noisy warning).
         gate.set()
-        await transcribe_tasks[0]
+        for t in transcribe_tasks:
+            await t
 
     asyncio.run(_drive())
 

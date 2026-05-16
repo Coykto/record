@@ -128,7 +128,7 @@ final class ProtocolTests: XCTestCase {
                 "stopped",
                 .stopped(
                     durationSeconds: 42.5,
-                    outputPath: "/abs/path/to/2026-05-10T14-32-08.wav"
+                    basename: "/abs/path/to/2026-05-10T14-32-08"
                 )
             ),
             ("error", .error(message: "capture binary missing")),
@@ -157,6 +157,42 @@ final class ProtocolTests: XCTestCase {
                 .videoFile(
                     path: "/abs/path/to/2026-05-10T14-32-08.mp4",
                     durationSeconds: 612.4
+                )
+            ),
+            // Spec 005 audio_file events (one per status value).
+            // `truncated_at_offset_seconds` is null on the wire for the two
+            // non-truncated statuses and round-trips to Swift `nil`; on
+            // re-encode the key is omitted (encodeIfPresent), which matches
+            // the existing optional-field convention and still round-trips
+            // to the same typed value.
+            (
+                "audio_file_captured_normally",
+                .audioFile(
+                    path: "/abs/path/to/2026-05-10T14-32-08-mic.wav",
+                    source: .mic,
+                    durationSeconds: 312.4,
+                    status: "captured_normally",
+                    truncatedAtOffsetSeconds: nil
+                )
+            ),
+            (
+                "audio_file_silent_throughout",
+                .audioFile(
+                    path: "/abs/path/to/2026-05-10T14-32-08-mic.wav",
+                    source: .mic,
+                    durationSeconds: 312.4,
+                    status: "silent_throughout",
+                    truncatedAtOffsetSeconds: nil
+                )
+            ),
+            (
+                "audio_file_truncated_at_offset",
+                .audioFile(
+                    path: "/abs/path/to/2026-05-10T14-32-08-mic.wav",
+                    source: .mic,
+                    durationSeconds: 134.2,
+                    status: "truncated_at_offset",
+                    truncatedAtOffsetSeconds: 134.2
                 )
             ),
             (

@@ -151,6 +151,31 @@ def _format_duration(seconds: float | None) -> str:
     return f"{minutes}m {secs:02d}s"
 
 
+def _humanize_audio_file_status(
+    status: str | None,
+    truncated_at_offset_seconds: float | None = None,
+) -> str:
+    """Map a wire-level ``audio_file.status`` to a stop-summary label.
+
+    Handles all four wire-level statuses: ``captured_normally``, ``pending``
+    (also ``None``), ``truncated_at_offset``, and ``silent_throughout``.
+    Unknown values fall through to the raw string so a future status surfaces
+    visibly rather than silently rendering as empty.
+    """
+    if status == "captured_normally":
+        return "captured normally"
+    if status == "pending" or status is None:
+        return "(not produced)"
+    if status == "truncated_at_offset":
+        return (
+            f"truncated at {_format_offset(truncated_at_offset_seconds)} "
+            f"— file ends there"
+        )
+    if status == "silent_throughout":
+        return "silent throughout"
+    return status
+
+
 def _format_offset(seconds: float | None) -> str:
     if seconds is None:
         return "??:??"
@@ -255,13 +280,23 @@ def _print_stop_summary(final: dict[str, Any]) -> None:
     Factored out so the new socket-client ``record stop`` and the legacy
     summary tests share one renderer.
     """
-    output_path = final.get("output_path") or "(unknown)"
     duration = _format_duration(final.get("duration_seconds"))
     sources_line = _summarize_sources(final)
     video_line = _summarize_video(final)
 
     typer.echo("capture stopped")
-    typer.echo(f"  output:   {output_path}")
+    audio_files = final.get("audio_files") or {}
+    for source in ("mic", "system_audio"):
+        entry = (
+            audio_files.get(source) if isinstance(audio_files, dict) else None
+        ) or {}
+        path = entry.get("path") or "(not produced)"
+        entry_duration = _format_duration(entry.get("duration_seconds"))
+        status_human = _humanize_audio_file_status(
+            entry.get("status"),
+            entry.get("truncated_at_offset_seconds"),
+        )
+        typer.echo(f"  {source}: {path}   {entry_duration}   {status_human}")
     typer.echo(f"  duration: {duration}")
     typer.echo(f"  sources:  {sources_line}")
     typer.echo(f"  {video_line}")
@@ -296,9 +331,17 @@ def start() -> None:
         raise typer.Exit(code=1) from None
 
     if resp.status == "ok":
-        typer.echo(
-            f"capture started -> audio={resp.audio_path}, video={resp.video_path}"
-        )
+        if resp.audio_paths:
+            typer.echo("capture started")
+            mic_path = resp.audio_paths.get("mic")
+            sys_path = resp.audio_paths.get("system_audio")
+            typer.echo(f"  audio (mic):          {mic_path}")
+            typer.echo(f"  audio (system_audio): {sys_path}")
+            typer.echo(f"  video:                {resp.video_path}")
+        else:
+            typer.echo(
+                f"capture started -> audio={resp.audio_path}, video={resp.video_path}"
+            )
         return
 
     if resp.status == "already_running":

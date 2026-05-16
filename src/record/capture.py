@@ -376,8 +376,22 @@ def _initial_state(supervisor_pid: int) -> dict[str, Any]:
     return {
         "pid": supervisor_pid,
         "start_time": None,
-        "output_path": None,
+        "basename": None,
         "video_output_path": None,
+        "audio_files": {
+            "mic": {
+                "path": None,
+                "status": "pending",
+                "duration_seconds": None,
+                "truncated_at_offset_seconds": None,
+            },
+            "system_audio": {
+                "path": None,
+                "status": "pending",
+                "duration_seconds": None,
+                "truncated_at_offset_seconds": None,
+            },
+        },
         "sources": {
             "mic": {
                 "status": "never_attached",
@@ -472,7 +486,7 @@ def _apply_event(current: dict[str, Any], event: ipc.Event) -> dict[str, Any]:
     if isinstance(event, ipc.StoppedEvent):
         current["stopped_at"] = now
         current["duration_seconds"] = event.duration_seconds
-        current["output_path"] = event.output_path
+        current["basename"] = event.basename
         return current
 
     if isinstance(event, ipc.VideoStartedEvent):
@@ -510,6 +524,14 @@ def _apply_event(current: dict[str, Any], event: ipc.Event) -> dict[str, Any]:
     if isinstance(event, ipc.VideoFileEvent):
         current["video_output_path"] = event.path
         current["video_file_duration_seconds"] = event.duration_seconds
+        return current
+
+    if isinstance(event, ipc.AudioFileEvent):
+        entry = current["audio_files"][event.source]
+        entry["path"] = event.path
+        entry["status"] = event.status
+        entry["duration_seconds"] = event.duration_seconds
+        entry["truncated_at_offset_seconds"] = event.truncated_at_offset_seconds
         return current
 
     if isinstance(event, ipc.DisplayReconfiguredEvent):
@@ -1119,7 +1141,7 @@ class CaptureSession:
     def __init__(
         self,
         *,
-        output_path: Path,
+        basename: Path,
         video_output_path: Path | None,
         sample_rate: int,
         bit_depth: int,
@@ -1129,7 +1151,7 @@ class CaptureSession:
         state_file_path: Path | None = None,
         child: "SwiftChild | None" = None,
     ) -> None:
-        self._output_path = output_path
+        self._basename = basename
         self._video_output_path = video_output_path
         self._sample_rate = sample_rate
         self._bit_depth = bit_depth
@@ -1182,8 +1204,8 @@ class CaptureSession:
         return self._state
 
     @property
-    def output_path(self) -> Path:
-        return self._output_path
+    def basename(self) -> Path:
+        return self._basename
 
     @property
     def video_output_path(self) -> Path | None:
@@ -1285,8 +1307,13 @@ class CaptureSession:
 
         # Persist the initial state with the configured paths so a status
         # snapshot taken between attach and ``started`` still reports the
-        # right filenames.
-        self._state["output_path"] = str(self._output_path)
+        # right filenames. Spec 005: two derived per-source paths instead of
+        # one mixed output path.
+        mic_path = self._basename.parent / (self._basename.name + "-mic.wav")
+        system_path = self._basename.parent / (self._basename.name + "-system.wav")
+        self._state["basename"] = str(self._basename)
+        self._state["audio_files"]["mic"]["path"] = str(mic_path)
+        self._state["audio_files"]["system_audio"]["path"] = str(system_path)
         self._state["video_output_path"] = (
             str(self._video_output_path) if self._video_output_path else None
         )
@@ -1294,7 +1321,7 @@ class CaptureSession:
 
         _log.info(
             "capture_session_starting",
-            output_path=str(self._output_path),
+            basename=str(self._basename),
             video_output_path=(
                 str(self._video_output_path) if self._video_output_path else None
             ),
@@ -1303,7 +1330,9 @@ class CaptureSession:
 
         # Send the ``start`` command. The Swift binary's first event is
         # ``ready`` (consumed by SwiftChild before this point); ``started``
-        # arrives after our command lands.
+        # arrives after our command lands. ``output_path`` keeps its JSON
+        # key but now carries a basename (no extension); the binary derives
+        # the two .wav paths from it.
         video_config = (
             ipc.VideoConfig(fps=30, show_cursor=True)
             if self._video_output_path
@@ -1312,7 +1341,7 @@ class CaptureSession:
         assert self._child is not None
         self._child.send_command(
             ipc.StartCommand(
-                output_path=str(self._output_path),
+                output_path=str(self._basename),
                 format=ipc.AudioFormat(
                     sample_rate=self._sample_rate,
                     bit_depth=self._bit_depth,
@@ -1461,7 +1490,7 @@ class CaptureSession:
                 f"[{_utcnow_iso()}]",
                 "capture ended by system event",
                 f"reason={ended_by}",
-                f"audio={self._state.get('output_path')}",
+                f"audio={self._state.get('basename')}",
             ]
             video_path = self._state.get("video_output_path")
             if video_path:

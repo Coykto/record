@@ -193,7 +193,11 @@ def test_start_happy_path_prints_paths_from_response(
         return control.ControlResponse(
             status="ok",
             capture_id="2026-05-13T09-21-48",
-            audio_path="/abs/2026-05-13T09-21-48.wav",
+            audio_path="/abs/2026-05-13T09-21-48-mic.wav",
+            audio_paths={
+                "mic": "/abs/2026-05-13T09-21-48-mic.wav",
+                "system_audio": "/abs/2026-05-13T09-21-48-system.wav",
+            },
             video_path="/abs/2026-05-13T09-21-48.mp4",
         )
 
@@ -201,8 +205,9 @@ def test_start_happy_path_prints_paths_from_response(
     result = runner.invoke(cli.app, ["start"])
     assert result.exit_code == 0, result.stderr
     assert "capture started" in result.stdout
-    assert "audio=/abs/2026-05-13T09-21-48.wav" in result.stdout
-    assert "video=/abs/2026-05-13T09-21-48.mp4" in result.stdout
+    assert "/abs/2026-05-13T09-21-48-mic.wav" in result.stdout
+    assert "/abs/2026-05-13T09-21-48-system.wav" in result.stdout
+    assert "/abs/2026-05-13T09-21-48.mp4" in result.stdout
     assert len(srv.calls) == 1
     assert isinstance(srv.calls[0], control.StartRequest)
 
@@ -302,7 +307,12 @@ def test_stop_happy_path_renders_summary_from_state_file(
     """Daemon responds ok → CLI re-reads capture-state.json → prints summary."""
     fake_paths["state"].write_text(
         (
-            '{"output_path": "/abs/x.wav", "duration_seconds": 42.5, '
+            '{"basename": "/abs/x", "duration_seconds": 42.5, '
+            '"audio_files": {'
+            '"mic": {"path": "/abs/x-mic.wav", "status": "captured_normally", '
+            '"duration_seconds": 42.5, "truncated_at_offset_seconds": null}, '
+            '"system_audio": {"path": "/abs/x-system.wav", "status": "captured_normally", '
+            '"duration_seconds": 42.5, "truncated_at_offset_seconds": null}}, '
             '"sources": {"mic": {"status": "attached"}, '
             '"system_audio": {"status": "attached"}, '
             '"video": {"status": "never_attached"}}, '
@@ -315,7 +325,11 @@ def test_stop_happy_path_renders_summary_from_state_file(
         assert isinstance(req, control.StopRequest)
         return control.ControlResponse(
             status="ok",
-            audio_path="/abs/x.wav",
+            audio_path="/abs/x-mic.wav",
+            audio_paths={
+                "mic": "/abs/x-mic.wav",
+                "system_audio": "/abs/x-system.wav",
+            },
             video_path=None,
         )
 
@@ -323,8 +337,46 @@ def test_stop_happy_path_renders_summary_from_state_file(
     result = runner.invoke(cli.app, ["stop"])
     assert result.exit_code == 0, result.stderr
     assert "capture stopped" in result.stdout
-    assert "/abs/x.wav" in result.stdout
+    assert "/abs/x-mic.wav" in result.stdout
+    assert "/abs/x-system.wav" in result.stdout
+    assert "captured normally" in result.stdout
     assert "microphone + system audio" in result.stdout
+
+
+def test_stop_summary_renders_truncated_at_offset_for_mic(
+    stub_server: Any, fake_paths: dict[str, Path]
+) -> None:
+    """A mic file with status=truncated_at_offset renders MM:SS + 'file ends there'."""
+    fake_paths["state"].write_text(
+        (
+            '{"basename": "/abs/x", "duration_seconds": 200.0, '
+            '"audio_files": {'
+            '"mic": {"path": "/abs/x-mic.wav", "status": "truncated_at_offset", '
+            '"duration_seconds": 134.0, "truncated_at_offset_seconds": 134.0}, '
+            '"system_audio": {"path": "/abs/x-system.wav", "status": "captured_normally", '
+            '"duration_seconds": 200.0, "truncated_at_offset_seconds": null}}, '
+            '"sources": {"mic": {"status": "attached"}, '
+            '"system_audio": {"status": "attached"}, '
+            '"video": {"status": "never_attached"}}, '
+            '"warnings": [], "final": true}'
+        ),
+        encoding="utf-8",
+    )
+    stub_server(lambda req: control.ControlResponse(status="ok"))
+    result = runner.invoke(cli.app, ["stop"])
+    assert result.exit_code == 0, result.stderr
+    assert "truncated at 02:14 — file ends there" in result.stdout
+
+
+def test_humanize_audio_file_status_truncated_at_offset_without_seconds() -> None:
+    """Missing truncated_at_offset_seconds falls back to ??:?? via _format_offset."""
+    rendered = cli._humanize_audio_file_status("truncated_at_offset", None)
+    assert rendered == "truncated at ??:?? — file ends there"
+
+
+def test_humanize_audio_file_status_silent_throughout() -> None:
+    """A silent_throughout status renders the literal label 'silent throughout'."""
+    assert cli._humanize_audio_file_status("silent_throughout") == "silent throughout"
 
 
 def test_stop_exits_2_on_permission_denied_in_state_file(
@@ -560,7 +612,14 @@ def test_stop_summary_video_attached_renders_path_and_dimensions(
 ) -> None:
     fake_paths["state"].write_text(
         (
-            '{"output_path": "/abs/2026-05-11T12-00-00.wav", '
+            '{"basename": "/abs/2026-05-11T12-00-00", '
+            '"audio_files": {'
+            '"mic": {"path": "/abs/2026-05-11T12-00-00-mic.wav", '
+            '"status": "captured_normally", "duration_seconds": 12.3, '
+            '"truncated_at_offset_seconds": null}, '
+            '"system_audio": {"path": "/abs/2026-05-11T12-00-00-system.wav", '
+            '"status": "captured_normally", "duration_seconds": 12.3, '
+            '"truncated_at_offset_seconds": null}}, '
             '"video_output_path": "/abs/2026-05-11T12-00-00.mp4", '
             '"duration_seconds": 12.3, "video_file_duration_seconds": 12.3, '
             '"sources": {"mic": {"status": "attached"}, '
@@ -585,7 +644,14 @@ def test_stop_summary_video_lost_offset_zero_renders_unavailable(
 ) -> None:
     fake_paths["state"].write_text(
         (
-            '{"output_path": "/abs/2026-05-11T12-00-00.wav", '
+            '{"basename": "/abs/2026-05-11T12-00-00", '
+            '"audio_files": {'
+            '"mic": {"path": "/abs/2026-05-11T12-00-00-mic.wav", '
+            '"status": "captured_normally", "duration_seconds": 9.5, '
+            '"truncated_at_offset_seconds": null}, '
+            '"system_audio": {"path": "/abs/2026-05-11T12-00-00-system.wav", '
+            '"status": "captured_normally", "duration_seconds": 9.5, '
+            '"truncated_at_offset_seconds": null}}, '
             '"video_output_path": null, "duration_seconds": 9.5, '
             '"sources": {"mic": {"status": "attached"}, '
             '"system_audio": {"status": "attached"}, '
@@ -607,7 +673,14 @@ def test_stop_summary_video_lost_mid_capture_renders_path_and_offset(
 ) -> None:
     fake_paths["state"].write_text(
         (
-            '{"output_path": "/abs/2026-05-11T12-00-00.wav", '
+            '{"basename": "/abs/2026-05-11T12-00-00", '
+            '"audio_files": {'
+            '"mic": {"path": "/abs/2026-05-11T12-00-00-mic.wav", '
+            '"status": "captured_normally", "duration_seconds": 200.0, '
+            '"truncated_at_offset_seconds": null}, '
+            '"system_audio": {"path": "/abs/2026-05-11T12-00-00-system.wav", '
+            '"status": "captured_normally", "duration_seconds": 200.0, '
+            '"truncated_at_offset_seconds": null}}, '
             '"video_output_path": "/abs/2026-05-11T12-00-00.mp4", '
             '"duration_seconds": 200.0, '
             '"sources": {"mic": {"status": "attached"}, '
@@ -632,7 +705,14 @@ def test_stop_summary_video_never_attached_renders_status(
 ) -> None:
     fake_paths["state"].write_text(
         (
-            '{"output_path": "/abs/2026-05-11T12-00-00.wav", '
+            '{"basename": "/abs/2026-05-11T12-00-00", '
+            '"audio_files": {'
+            '"mic": {"path": "/abs/2026-05-11T12-00-00-mic.wav", '
+            '"status": "captured_normally", "duration_seconds": 3.0, '
+            '"truncated_at_offset_seconds": null}, '
+            '"system_audio": {"path": "/abs/2026-05-11T12-00-00-system.wav", '
+            '"status": "captured_normally", "duration_seconds": 3.0, '
+            '"truncated_at_offset_seconds": null}}, '
             '"video_output_path": "/abs/2026-05-11T12-00-00.mp4", '
             '"duration_seconds": 3.0, '
             '"sources": {"mic": {"status": "attached"}, '

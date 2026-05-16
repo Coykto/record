@@ -53,7 +53,13 @@ class StartCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cmd: Literal["start"] = "start"
-    output_path: str = Field(..., description="Absolute path of the WAV file to write.")
+    output_path: str = Field(
+        ...,
+        description=(
+            "Absolute basename (no extension) of the recording. The daemon "
+            "appends `-mic.wav` and `-system.wav`."
+        ),
+    )
     format: AudioFormat
     video_output_path: str | None = Field(
         default=None,
@@ -149,6 +155,7 @@ SourceName = Literal["mic", "system_audio"]
 PermissionKind = Literal["microphone", "screen_recording", "accessibility"]
 VideoReconfigReason = Literal["primary_changed", "resolution_changed", "display_removed"]
 SystemEventReason = Literal["system_sleep", "display_sleep", "screen_locked"]
+AudioFileStatus = Literal["captured_normally", "silent_throughout", "truncated_at_offset"]
 
 
 class ReadyEvent(BaseModel):
@@ -201,7 +208,7 @@ class StoppedEvent(BaseModel):
 
     event: Literal["stopped"] = "stopped"
     duration_seconds: float
-    output_path: str
+    basename: str
 
 
 class ErrorEvent(BaseModel):
@@ -246,6 +253,25 @@ class VideoFileEvent(BaseModel):
     event: Literal["video_file"] = "video_file"
     path: str
     duration_seconds: float
+
+
+class AudioFileEvent(BaseModel):
+    """Emitted once per finalized audio WAV at end of capture.
+
+    One event per source. ``status`` distinguishes a normal recording from
+    a fully silent capture or a mid-capture source loss; the
+    ``truncated_at_offset_seconds`` field is only meaningful when
+    ``status == "truncated_at_offset"``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event: Literal["audio_file"] = "audio_file"
+    path: str
+    source: SourceName
+    duration_seconds: float
+    status: AudioFileStatus
+    truncated_at_offset_seconds: float | None = None
 
 
 class DisplayReconfiguredEvent(BaseModel):
@@ -334,6 +360,7 @@ Event = Annotated[
         VideoStartedEvent,
         VideoLostEvent,
         VideoFileEvent,
+        AudioFileEvent,
         DisplayReconfiguredEvent,
         CaptureEndedBySystemEventEvent,
         HotkeyRegisteredEvent,
@@ -409,6 +436,7 @@ __all__ = [
     "VideoStartedEvent",
     "VideoLostEvent",
     "VideoFileEvent",
+    "AudioFileEvent",
     "DisplayReconfiguredEvent",
     "CaptureEndedBySystemEventEvent",
     "HotkeyRegisteredEvent",
@@ -419,6 +447,7 @@ __all__ = [
     "PermissionKind",
     "VideoReconfigReason",
     "SystemEventReason",
+    "AudioFileStatus",
     "Modifier",
     "HotkeyRegistrationStatus",
     "serialize_command",

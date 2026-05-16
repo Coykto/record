@@ -79,6 +79,25 @@ def test_serialize_response_strips_none_fields() -> None:
     assert line == '{"status":"ok"}'
 
 
+def test_control_response_audio_paths_round_trip() -> None:
+    """Spec 005: ``audio_paths`` carries per-source WAV paths on start/stop."""
+    resp = control.ControlResponse(
+        status="ok",
+        audio_path="/abs/2026-05-15T14-32-08-mic.wav",
+        audio_paths={
+            "mic": "/abs/2026-05-15T14-32-08-mic.wav",
+            "system_audio": "/abs/2026-05-15T14-32-08-system.wav",
+        },
+    )
+    line = control.serialize_response(resp)
+    parsed = control.parse_response(line)
+    assert parsed.audio_paths == {
+        "mic": "/abs/2026-05-15T14-32-08-mic.wav",
+        "system_audio": "/abs/2026-05-15T14-32-08-system.wav",
+    }
+    assert parsed.audio_path == "/abs/2026-05-15T14-32-08-mic.wav"
+
+
 # ---------------------------------------------------------------------------
 # Server round-trips against a stub handler
 # ---------------------------------------------------------------------------

@@ -29,8 +29,9 @@ enum AudioCaptureError: Error, CustomStringConvertible {
 ///
 /// Both the SCStream sample-handler queue and the `AVAudioEngine` tap
 /// closure (which runs off the audio render thread per Apple's contract
-/// for `installTap`) hand off into one of these. The mixer drain pump
-/// pulls from both and writes the sum to the WAV.
+/// for `installTap`) hand off into one of these. The drain pump pulls
+/// from each queue independently and writes the samples to that source's
+/// own WAV (no mixing — spec 005).
 ///
 /// `NSLock` is fine here: neither producer nor consumer runs on the
 /// real-time audio render thread, so we're not violating the no-lock rule.
@@ -77,25 +78,32 @@ private final class LockedQueue {
 }
 
 /// Owns the SCStream system-audio capture, the AVAudioEngine mic capture,
-/// the per-source converters, the software mixer, and the WAV writer.
+/// the per-source converters, and the two independent per-source WAV writers.
 ///
-/// ## Mixer design (Slice 4)
+/// ## Two-writer design (spec 005)
 ///
-/// We use a software ring-buffer mixer rather than an `AVAudioMixerNode`.
-/// Rationale: the SCStream and engine paths are already independent producers
-/// that each emit `AVAudioPCMBuffer`s via their own callbacks. Sending those
-/// through an `AVAudioMixerNode` would mean either an `AVAudioSourceNode`
-/// (whose render block runs on the real-time audio thread and must drain a
-/// lock-free queue) or a player node (which buffers whole files, not realtime
-/// streams). Both add complexity for no gain. Instead each producer converts
-/// to int16 mono 16 kHz, appends to a `LockedQueue`, and a serial timer pump
-/// pulls equal-length frames from both queues every ~10 ms, sums with
-/// clamped addition, and writes the result to the WAV.
+/// Each source is converted to int16 mono 16 kHz and appended to its own
+/// `LockedQueue`. A serial timer pump drains each queue independently and
+/// writes each side's samples to its own `WAVWriter` — no mixing, no
+/// cross-talk, no zero-padding the "shorter side". A failure on one source
+/// closes only its writer; the other continues until `stop()` runs.
 final class AudioCapture: NSObject {
 
-    private let outputURL: URL
+    /// Output basename (no extension). The two writers' file URLs are
+    /// derived by appending `-mic.wav` and `-system.wav` to this path.
+    private let basename: URL
     private let emit: (Event) -> Void
-    private let wavWriter: WAVWriter
+    /// Shared int16 / mono / 16 kHz interleaved processing format. Both writers
+    /// share it; the per-source converters target it; the synthetic feeder
+    /// builds buffers against it. Constructed once at init so we never re-derive
+    /// it from one of the writers (which may be nilled on close).
+    private let processingFormat: AVAudioFormat
+    /// Derived output URLs, retained so `stop()` can emit `audio_file` events
+    /// carrying the on-disk paths after the writers are closed and nilled.
+    private let micURL: URL
+    private let systemURL: URL
+    private var micWriter: WAVWriter?
+    private var systemWriter: WAVWriter?
 
     /// Background queue that receives `CMSampleBuffer`s from SCStream.
     private let sampleQueue = DispatchQueue(
@@ -103,10 +111,10 @@ final class AudioCapture: NSObject {
         qos: .userInitiated
     )
 
-    /// Serial queue that drives the mixer pump timer. The pump pulls from both
-    /// ring buffers, sums, and writes to the WAV.
+    /// Serial queue that drives the drain pump timer. The pump pulls from
+    /// each ring buffer independently and writes to its source's own WAV.
     private let mixerQueue = DispatchQueue(
-        label: "record.audiocapture.mixer",
+        label: "record.audiocapture.drain",
         qos: .userInitiated
     )
 
@@ -138,6 +146,26 @@ final class AudioCapture: NSObject {
     private let lossLock = NSLock()
     private var micLost = false
     private var systemAudioLost = false
+    /// Offset-from-start (seconds) at which mic was declared lost. Drives the
+    /// `truncated_at_offset` status path in `finalizeWriters`. Nil means the
+    /// mic file was not truncated.
+    private var micTruncatedAtOffsetSeconds: Double?
+    private var systemTruncatedAtOffsetSeconds: Double?
+
+    // --- Silent-source detection (Slice 4) ---
+    //
+    // Flipped to `true` the first time `writeSamples` observes any non-zero
+    // Int16 sample for the corresponding source, and never flipped back. On
+    // stop, `finalizeWriters` reads these to choose between
+    // `"captured_normally"` and `"silent_throughout"`. Mutated only from the
+    // mixer-pump queue (`drainAndWrite`) and the source-loss handlers
+    // (`handleMicLost` / `handleSystemAudioLost`), both of which are
+    // serialized w.r.t. each other by the lifecycle of the writer they
+    // share — once the writer is closed, the loss handler no longer calls
+    // `writeSamples` for that source. A plain stored property is therefore
+    // sufficient; no lock needed.
+    private var micHasNonzeroSamples = false
+    private var systemHasNonzeroSamples = false
 
     /// Token for the `AVAudioEngineConfigurationChange` observer. Retained
     /// here so `stop()` can remove it; the block-based NotificationCenter API
@@ -155,6 +183,16 @@ final class AudioCapture: NSObject {
     // int16 samples directly to micQueue and systemQueue. No TCC permissions
     // are touched. The mixer pump then drains/mixes/writes the WAV unchanged.
     private let testSilentSources: Bool
+    /// When non-nil and `testSilentSources == true`, the synthetic feeder
+    /// schedules a one-shot `handleMicLost` after this many seconds so the
+    /// integration test can exercise the mid-capture mic-truncation path
+    /// deterministically. Ignored when sources are real.
+    private let injectMicLossAfterSeconds: Double?
+    /// When true and `testSilentSources == true`, the synthetic feeder writes
+    /// all-zero Int16 samples on the mic side (system side unchanged). Drives
+    /// the slice 4 integration test for `status="silent_throughout"`. Ignored
+    /// when sources are real.
+    private let silentMicSource: Bool
     private var syntheticQueue: DispatchQueue?
     private var syntheticTimer: DispatchSourceTimer?
     /// Frame index of the next synthetic sample to emit. Used to derive the
@@ -162,14 +200,29 @@ final class AudioCapture: NSObject {
     private var syntheticFrameIndex: Int = 0
 
     init(
-        outputURL: URL,
+        basename: URL,
         emit: @escaping (Event) -> Void,
-        testSilentSources: Bool = false
+        testSilentSources: Bool = false,
+        injectMicLossAfterSeconds: Double? = nil,
+        silentMicSource: Bool = false
     ) throws {
-        self.outputURL = outputURL
+        self.basename = basename
         self.emit = emit
         self.testSilentSources = testSilentSources
-        self.wavWriter = try WAVWriter(url: outputURL)
+        self.injectMicLossAfterSeconds = injectMicLossAfterSeconds
+        self.silentMicSource = silentMicSource
+        // Append the per-source suffix to the basename's path. We can't use
+        // `URL.appendingPathExtension` because the basename has no extension
+        // *and* we want to add a literal `-mic`/`-system` infix before `.wav`.
+        let micURL = URL(fileURLWithPath: basename.path + "-mic.wav")
+        let systemURL = URL(fileURLWithPath: basename.path + "-system.wav")
+        self.micURL = micURL
+        self.systemURL = systemURL
+        let micWriter = try WAVWriter(url: micURL)
+        let systemWriter = try WAVWriter(url: systemURL)
+        self.processingFormat = micWriter.processingFormat
+        self.micWriter = micWriter
+        self.systemWriter = systemWriter
         super.init()
     }
 
@@ -246,18 +299,23 @@ final class AudioCapture: NSObject {
     }
 
     /// Stop the SCStream and the mic engine, drain any leftover frames into
-    /// the WAV, finalize the WAV, return elapsed seconds since `start()`
-    /// returned.
+    /// each writer, finalize both writers, emit one `audio_file` event per
+    /// finalized writer, return elapsed seconds since `start()` returned.
+    ///
+    /// The `audio_file` events are emitted on the wire *before* this function
+    /// returns so callers can emit `stopped` immediately after — preserving
+    /// the documented event order (per-file `audio_file` events first, then
+    /// `stopped`).
     func stop() async -> Double {
         if testSilentSources {
             // Test mode: no real sources were ever started; just halt the
-            // synthetic feeder, drain the mixer one last time, and finalize.
+            // synthetic feeder, drain each writer one last time, and finalize.
             stopSyntheticFeeder()
             stopMixerPump()
-            drainAndMix(finalFlush: true)
-            wavWriter.close()
-            guard let startedAt = startedAt else { return 0 }
-            return Date().timeIntervalSince(startedAt)
+            drainAndWrite(finalFlush: true)
+            let elapsed = startedAt.map { Date().timeIntervalSince($0) } ?? 0
+            finalizeWriters(elapsed: elapsed)
+            return elapsed
         }
 
         // Drop the engine-config observer before tearing anything down: once
@@ -284,14 +342,83 @@ final class AudioCapture: NSObject {
         }
 
         stopMixerPump()
-        // One final mix pass to flush whatever samples are still buffered.
-        drainAndMix(finalFlush: true)
+        // One final drain pass to flush whatever samples are still buffered.
+        drainAndWrite(finalFlush: true)
 
-        wavWriter.close()
-        guard let startedAt = startedAt else {
-            return 0
+        let elapsed = startedAt.map { Date().timeIntervalSince($0) } ?? 0
+        finalizeWriters(elapsed: elapsed)
+        return elapsed
+    }
+
+    /// Close any writer still open and emit one `audio_file` event per source.
+    /// A source that was lost mid-capture has already had its writer closed
+    /// by the loss handler — we still emit its event here, with
+    /// `status="truncated_at_offset"` and the captured offset as the duration.
+    private func finalizeWriters(elapsed: Double) {
+        if let writer = systemWriter {
+            writer.close()
+            systemWriter = nil
         }
-        return Date().timeIntervalSince(startedAt)
+        if let writer = micWriter {
+            writer.close()
+            micWriter = nil
+        }
+
+        // Status precedence per spec 005 slice 4:
+        //   1. truncation (slice 3 behavior — kept exactly bit-for-bit)
+        //   2. silent_throughout (no non-zero sample ever observed)
+        //   3. captured_normally (default)
+        if let offset = systemTruncatedAtOffsetSeconds {
+            emit(.audioFile(
+                path: systemURL.path,
+                source: .systemAudio,
+                durationSeconds: offset,
+                status: "truncated_at_offset",
+                truncatedAtOffsetSeconds: offset
+            ))
+        } else if !systemHasNonzeroSamples {
+            emit(.audioFile(
+                path: systemURL.path,
+                source: .systemAudio,
+                durationSeconds: elapsed,
+                status: "silent_throughout",
+                truncatedAtOffsetSeconds: nil
+            ))
+        } else {
+            emit(.audioFile(
+                path: systemURL.path,
+                source: .systemAudio,
+                durationSeconds: elapsed,
+                status: "captured_normally",
+                truncatedAtOffsetSeconds: nil
+            ))
+        }
+
+        if let offset = micTruncatedAtOffsetSeconds {
+            emit(.audioFile(
+                path: micURL.path,
+                source: .mic,
+                durationSeconds: offset,
+                status: "truncated_at_offset",
+                truncatedAtOffsetSeconds: offset
+            ))
+        } else if !micHasNonzeroSamples {
+            emit(.audioFile(
+                path: micURL.path,
+                source: .mic,
+                durationSeconds: elapsed,
+                status: "silent_throughout",
+                truncatedAtOffsetSeconds: nil
+            ))
+        } else {
+            emit(.audioFile(
+                path: micURL.path,
+                source: .mic,
+                durationSeconds: elapsed,
+                status: "captured_normally",
+                truncatedAtOffsetSeconds: nil
+            ))
+        }
     }
 
     // MARK: - System-audio (SCStream) setup
@@ -347,7 +474,7 @@ final class AudioCapture: NSObject {
 
         // Pre-build the mic converter so the first tap callback doesn't have
         // to do allocation under the audio thread's timing pressure.
-        if let converter = AVAudioConverter(from: inputFormat, to: wavWriter.processingFormat) {
+        if let converter = AVAudioConverter(from: inputFormat, to: processingFormat) {
             micConverter = converter
             micConverterInputFormat = inputFormat
         } // else: built lazily in handleMicBuffer once we see a real format.
@@ -490,15 +617,26 @@ final class AudioCapture: NSObject {
         lossLock.unlock()
 
         let offset = startedAt.map { Date().timeIntervalSince($0) } ?? 0
+        micTruncatedAtOffsetSeconds = offset
 
-        // Stop producing mic samples. Once the tap is gone, micQueue will
-        // simply stop growing and the mixer will zero-fill that side.
+        // Stop producing mic samples.
         if micTapInstalled {
             engine.inputNode.removeTap(onBus: 0)
             micTapInstalled = false
         }
         if engine.isRunning {
             engine.stop()
+        }
+
+        // Drain whatever is buffered into the mic writer, then close it so the
+        // file is finalized at the point of failure. `finalizeWriters` will
+        // still emit the `audio_file` event at stop, reading the truncation
+        // offset we just recorded.
+        if let writer = micWriter {
+            let leftover = micQueue.drainAll()
+            writeSamples(leftover, to: writer, label: "mic")
+            writer.close()
+            micWriter = nil
         }
 
         emit(.sourceLost(
@@ -520,6 +658,7 @@ final class AudioCapture: NSObject {
         lossLock.unlock()
 
         let offset = startedAt.map { Date().timeIntervalSince($0) } ?? 0
+        systemTruncatedAtOffsetSeconds = offset
 
         // Best-effort stop: SCStream may already be dead when the delegate
         // reports the error, so we don't await or surface a secondary failure.
@@ -531,6 +670,15 @@ final class AudioCapture: NSObject {
         // format that's no longer flowing.
         systemConverter = nil
         systemConverterInputFormat = nil
+
+        // Drain whatever is buffered into the system writer, then close it so
+        // the file is finalized at the point of failure.
+        if let writer = systemWriter {
+            let leftover = systemQueue.drainAll()
+            writeSamples(leftover, to: writer, label: "system")
+            writer.close()
+            systemWriter = nil
+        }
 
         emit(.sourceLost(
             source: .systemAudio,
@@ -573,7 +721,7 @@ final class AudioCapture: NSObject {
         converter: inout AVAudioConverter?,
         converterInputFormat: inout AVAudioFormat?
     ) -> AVAudioPCMBuffer? {
-        let outputFormat = wavWriter.processingFormat
+        let outputFormat = processingFormat
 
         if converter == nil || converterInputFormat != inputBuffer.format {
             guard let built = AVAudioConverter(from: inputBuffer.format, to: outputFormat) else {
@@ -641,7 +789,7 @@ final class AudioCapture: NSObject {
             repeating: .milliseconds(drainIntervalMs)
         )
         timer.setEventHandler { [weak self] in
-            self?.drainAndMix(finalFlush: false)
+            self?.drainAndWrite(finalFlush: false)
         }
         mixerTimer = timer
         timer.resume()
@@ -652,21 +800,20 @@ final class AudioCapture: NSObject {
         mixerTimer = nil
     }
 
-    // MARK: - Synthetic feeder (test mode, Slice 7)
+    // MARK: - Synthetic feeder (test mode)
 
     /// Drive both ring buffers from a deterministic timer.
     ///
-    /// Pattern: 1 s of silence followed by 1 s of a 440 Hz sine tone, looped
-    /// (period = 32000 frames at 16 kHz). Each tick appends ~160 samples per
-    /// source. Choice: silence is fed into `micQueue` and the tone is fed
-    /// into `systemQueue`, so the mixed WAV contains a recognizable 1-on /
-    /// 1-off tone pattern coming exclusively from the system-audio side —
-    /// which makes "did the system_audio path reach the mixer?" trivially
-    /// observable in CI.
+    /// Spec 005 pattern: a continuous 440 Hz sine tone on the mic source and a
+    /// continuous 880 Hz sine tone on the system source. Two distinct
+    /// frequencies on the two sides let the integration test FFT each output
+    /// WAV independently and assert "this file contains *its* tone and *only*
+    /// its tone" — i.e. the two-writer pipeline never lets one source's
+    /// samples bleed into the other writer.
     private func startSyntheticFeeder() {
         let q = DispatchQueue(label: "record.audiocapture.synthetic", qos: .userInitiated)
         let timer = DispatchSource.makeTimerSource(queue: q)
-        // ~160 frames per 10 ms at 16 kHz. Match the mixer pump cadence so the
+        // ~160 frames per 10 ms at 16 kHz. Match the drain pump cadence so the
         // queues stay shallow.
         let framesPerTick = 160
         timer.schedule(
@@ -680,6 +827,12 @@ final class AudioCapture: NSObject {
         syntheticTimer = timer
         syntheticFrameIndex = 0
         timer.resume()
+
+        if let after = injectMicLossAfterSeconds {
+            DispatchQueue.main.asyncAfter(deadline: .now() + after) { [weak self] in
+                self?.handleMicLost(reason: "synthetic injection: --inject-mic-loss-after-seconds")
+            }
+        }
     }
 
     private func stopSyntheticFeeder() {
@@ -690,78 +843,117 @@ final class AudioCapture: NSObject {
 
     /// Generate the next `framesPerTick` int16 samples for each side and
     /// enqueue them. Deterministic w.r.t. `syntheticFrameIndex` so test
-    /// assertions can predict the waveform exactly.
+    /// assertions can predict the waveform exactly. Mic side is a 440 Hz
+    /// sine; system side is an 880 Hz sine.
     private func tickSyntheticFeeder(framesPerTick: Int) {
         let sampleRate = 16000.0
-        let toneHz = 440.0
-        // Peak amplitude well below int16 full-scale to leave headroom for
-        // the mixer's clamped sum; matches the spec's "~0.5 of full-scale".
+        let micToneHz = 440.0
+        let systemToneHz = 880.0
+        // Peak amplitude well below int16 full-scale; matches the spec's
+        // "~0.5 of full-scale".
         let amplitude: Double = 16000.0
-        let periodFrames = 32000 // 1 s silence + 1 s tone, looped
 
-        let micSamples = [Int16](repeating: 0, count: framesPerTick)
+        var micSamples = [Int16](repeating: 0, count: framesPerTick)
         var sysSamples = [Int16](repeating: 0, count: framesPerTick)
 
         for i in 0..<framesPerTick {
-            let frame = (syntheticFrameIndex + i) % periodFrames
-            // First half (0..16000): silence. Second half (16000..32000): tone.
-            if frame >= 16000 {
-                let toneFrame = Double(frame - 16000)
-                let s = sin(2.0 * .pi * toneHz * toneFrame / sampleRate)
-                sysSamples[i] = Int16(clamping: Int(amplitude * s))
+            let frame = Double(syntheticFrameIndex + i)
+            // Slice 4: when `silentMicSource == true` the mic side stays at
+            // all-zero Int16 samples — the integration test asserts the
+            // resulting `audio_file` event carries `status="silent_throughout"`.
+            // System tone is unaffected.
+            if !silentMicSource {
+                let micS = sin(2.0 * .pi * micToneHz * frame / sampleRate)
+                micSamples[i] = Int16(clamping: Int(amplitude * micS))
             }
-            // micSamples stays zero (silence) for the entire pattern.
+            let sysS = sin(2.0 * .pi * systemToneHz * frame / sampleRate)
+            sysSamples[i] = Int16(clamping: Int(amplitude * sysS))
         }
         syntheticFrameIndex += framesPerTick
 
-        micSamples.withUnsafeBufferPointer { micQueue.append($0) }
-        sysSamples.withUnsafeBufferPointer { systemQueue.append($0) }
+        lossLock.lock()
+        let skipMic = micLost
+        let skipSystem = systemAudioLost
+        lossLock.unlock()
+
+        if !skipMic {
+            micSamples.withUnsafeBufferPointer { micQueue.append($0) }
+        }
+        if !skipSystem {
+            sysSamples.withUnsafeBufferPointer { systemQueue.append($0) }
+        }
     }
 
-    /// Pull whatever's available from each ring buffer, pad the shorter side
-    /// with zeros, sum with clamped addition, write one mixed buffer to the
-    /// WAV. On `finalFlush == true` we drain everything remaining.
-    private func drainAndMix(finalFlush: Bool) {
-        let sysAvailable = systemQueue.count
-        let micAvailable = micQueue.count
-
-        // Take the longer of the two so neither source is left behind. The
-        // shorter side gets zero-padded to match — that's the silence-fill
-        // case for a source that's briefly behind or hasn't started yet.
-        let target = max(sysAvailable, micAvailable)
-        if target == 0 {
-            return
+    /// Drain each ring buffer independently and write its samples directly to
+    /// the corresponding writer. No mixing, no zero-padding of the "shorter
+    /// side" — each writer advances on its own source's samples only.
+    /// On `finalFlush == true` we drain everything remaining from each side.
+    private func drainAndWrite(finalFlush: Bool) {
+        // System audio side.
+        if let writer = systemWriter {
+            let samples: [Int16]
+            if finalFlush {
+                samples = systemQueue.drainAll()
+            } else {
+                let depth = systemQueue.count
+                samples = depth > 0 ? systemQueue.drain(upTo: depth) : []
+            }
+            writeSamples(samples, to: writer, label: "system")
         }
 
-        // On the periodic pump we cap at the larger side's current depth.
-        // On the final flush we explicitly drain everything.
-        let sysSamples: [Int16]
-        let micSamples: [Int16]
-        if finalFlush {
-            sysSamples = systemQueue.drainAll()
-            micSamples = micQueue.drainAll()
-        } else {
-            sysSamples = systemQueue.drain(upTo: target)
-            micSamples = micQueue.drain(upTo: target)
+        // Mic side.
+        if let writer = micWriter {
+            let samples: [Int16]
+            if finalFlush {
+                samples = micQueue.drainAll()
+            } else {
+                let depth = micQueue.count
+                samples = depth > 0 ? micQueue.drain(upTo: depth) : []
+            }
+            writeSamples(samples, to: writer, label: "mic")
         }
+    }
 
-        let outCount = max(sysSamples.count, micSamples.count)
+    /// Helper: wrap `samples` in an `AVAudioPCMBuffer` and write to `writer`.
+    /// No-op on empty input. Emits an `error` event on writer failure.
+    ///
+    /// Also folds in slice 4's silent-source detection: cheap running OR over
+    /// the drained Int16 samples flips the corresponding `<source>HasNonzeroSamples`
+    /// flag the first time any non-zero sample is seen, after which the loop
+    /// short-circuits. `finalizeWriters` reads the flag to decide between
+    /// `"captured_normally"` and `"silent_throughout"`.
+    private func writeSamples(_ samples: [Int16], to writer: WAVWriter, label: String) {
+        let outCount = samples.count
         if outCount == 0 { return }
 
-        var mixed = [Int16](repeating: 0, count: outCount)
-        for i in 0..<outCount {
-            let s: Int32 = i < sysSamples.count ? Int32(sysSamples[i]) : 0
-            let m: Int32 = i < micSamples.count ? Int32(micSamples[i]) : 0
-            mixed[i] = Int16(clamping: s + m)
+        // Per-source non-zero detection. Only scan until the first non-zero
+        // sample lands; once the flag is set there is no work to do.
+        switch label {
+        case "mic":
+            if !micHasNonzeroSamples {
+                for s in samples where s != 0 {
+                    micHasNonzeroSamples = true
+                    break
+                }
+            }
+        case "system":
+            if !systemHasNonzeroSamples {
+                for s in samples where s != 0 {
+                    systemHasNonzeroSamples = true
+                    break
+                }
+            }
+        default:
+            break
         }
 
         guard let outBuffer = AVAudioPCMBuffer(
-            pcmFormat: wavWriter.processingFormat,
+            pcmFormat: processingFormat,
             frameCapacity: AVAudioFrameCount(outCount)
         ) else { return }
         outBuffer.frameLength = AVAudioFrameCount(outCount)
         if let dst = outBuffer.int16ChannelData?[0] {
-            mixed.withUnsafeBufferPointer { src in
+            samples.withUnsafeBufferPointer { src in
                 if let base = src.baseAddress {
                     dst.update(from: base, count: outCount)
                 }
@@ -769,9 +961,9 @@ final class AudioCapture: NSObject {
         }
 
         do {
-            try wavWriter.write(outBuffer)
+            try writer.write(outBuffer)
         } catch {
-            emit(.error(message: "wav write failed: \(error)"))
+            emit(.error(message: "\(label) wav write failed: \(error)"))
         }
     }
 

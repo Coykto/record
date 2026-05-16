@@ -57,7 +57,11 @@ EXPECTED_SAMPWIDTH_BYTES = 2  # 16-bit signed PCM
 def test_end_to_end_silent_sources(
     capture_binary: Path, tmp_path: Path
 ) -> None:
-    output_wav = tmp_path / "synthetic.wav"
+    # Spec 005: ``output_path`` is now an absolute basename without extension.
+    # The Swift binary derives ``-mic.wav`` and ``-system.wav`` from it.
+    output_basename = tmp_path / "synthetic"
+    mic_wav = tmp_path / "synthetic-mic.wav"
+    system_wav = tmp_path / "synthetic-system.wav"
 
     proc = subprocess.Popen(
         [str(capture_binary), "--test-silent-sources"],
@@ -104,7 +108,7 @@ def test_end_to_end_silent_sources(
         # 2. Send ``start`` with the format the real orchestrator negotiates.
         start_cmd = {
             "cmd": "start",
-            "output_path": str(output_wav),
+            "output_path": str(output_basename),
             "format": {
                 "sample_rate": EXPECTED_SAMPLE_RATE,
                 "bit_depth": 16,
@@ -214,9 +218,23 @@ def test_end_to_end_silent_sources(
         # ``stopped`` payload sanity.
         # ------------------------------------------------------------------
         stopped = events[-1]
-        assert stopped["output_path"] == str(output_wav), (
-            f"stopped.output_path mismatch: {stopped['output_path']!r} "
-            f"vs {str(output_wav)!r}"
+        assert stopped["basename"] == str(output_basename), (
+            f"stopped.basename mismatch: {stopped['basename']!r} "
+            f"vs {str(output_basename)!r}"
+        )
+
+        # Spec 005: exactly two ``audio_file`` events, one per source, must
+        # appear before the final ``stopped``.
+        audio_file_events = [
+            ev for ev in events if ev.get("event") == "audio_file"
+        ]
+        assert len(audio_file_events) == 2, (
+            f"expected exactly 2 audio_file events, got "
+            f"{len(audio_file_events)}: {audio_file_events!r}"
+        )
+        af_sources = sorted(ev["source"] for ev in audio_file_events)
+        assert af_sources == ["mic", "system_audio"], (
+            f"audio_file sources mismatch: {af_sources!r}"
         )
         # The reported duration is best-effort from the daemon's perspective.
         # We give it generous slack (+/-0.5 s) because the round-trip latency
@@ -231,32 +249,34 @@ def test_end_to_end_silent_sources(
         )
 
         # ------------------------------------------------------------------
-        # WAV file assertions.
+        # WAV file assertions — spec 005: two independent files per session.
         # ------------------------------------------------------------------
-        assert output_wav.exists(), f"WAV not written to {output_wav}"
+        assert mic_wav.exists(), f"mic WAV not written to {mic_wav}"
+        assert system_wav.exists(), f"system WAV not written to {system_wav}"
 
-        with wave.open(str(output_wav), "rb") as wf:
-            channels = wf.getnchannels()
-            framerate = wf.getframerate()
-            sampwidth = wf.getsampwidth()
-            nframes = wf.getnframes()
+        for wav_path in (mic_wav, system_wav):
+            with wave.open(str(wav_path), "rb") as wf:
+                channels = wf.getnchannels()
+                framerate = wf.getframerate()
+                sampwidth = wf.getsampwidth()
+                nframes = wf.getnframes()
 
-        assert channels == EXPECTED_CHANNELS, (
-            f"expected {EXPECTED_CHANNELS} channel(s), got {channels}"
-        )
-        assert framerate == EXPECTED_SAMPLE_RATE, (
-            f"expected {EXPECTED_SAMPLE_RATE} Hz, got {framerate}"
-        )
-        assert sampwidth == EXPECTED_SAMPWIDTH_BYTES, (
-            f"expected {EXPECTED_SAMPWIDTH_BYTES}-byte samples (16-bit PCM), "
-            f"got {sampwidth}"
-        )
+            assert channels == EXPECTED_CHANNELS, (
+                f"{wav_path}: expected {EXPECTED_CHANNELS} channel(s), got {channels}"
+            )
+            assert framerate == EXPECTED_SAMPLE_RATE, (
+                f"{wav_path}: expected {EXPECTED_SAMPLE_RATE} Hz, got {framerate}"
+            )
+            assert sampwidth == EXPECTED_SAMPWIDTH_BYTES, (
+                f"{wav_path}: expected {EXPECTED_SAMPWIDTH_BYTES}-byte samples "
+                f"(16-bit PCM), got {sampwidth}"
+            )
 
-        duration_actual = nframes / framerate
-        assert abs(duration_actual - CAPTURE_WINDOW_SECONDS) <= 0.5, (
-            f"WAV duration {duration_actual:.3f}s deviates from "
-            f"{CAPTURE_WINDOW_SECONDS}s by more than 500 ms"
-        )
+            duration_actual = nframes / framerate
+            assert abs(duration_actual - CAPTURE_WINDOW_SECONDS) <= 0.5, (
+                f"{wav_path}: WAV duration {duration_actual:.3f}s deviates from "
+                f"{CAPTURE_WINDOW_SECONDS}s by more than 500 ms"
+            )
 
     finally:
         if stop_timer is not None:
@@ -473,8 +493,12 @@ def test_end_to_end_silent_sources_with_synthetic_video(
     and the MP4 dimensions + duration + filename-stem pairing.
     """
     # Shared timestamp stem mirrors the supervisor's CWD-and-stem convention.
+    # Spec 005: ``output_path`` is the basename without extension; the Swift
+    # binary derives the two per-source WAVs.
     stem = "2026-05-12T00-00-00"
-    output_wav = tmp_path / f"{stem}.wav"
+    output_basename = tmp_path / stem
+    mic_wav = tmp_path / f"{stem}-mic.wav"
+    system_wav = tmp_path / f"{stem}-system.wav"
     output_mp4 = tmp_path / f"{stem}.mp4"
 
     proc = subprocess.Popen(
@@ -519,7 +543,7 @@ def test_end_to_end_silent_sources_with_synthetic_video(
 
         start_cmd = {
             "cmd": "start",
-            "output_path": str(output_wav),
+            "output_path": str(output_basename),
             "video_output_path": str(output_mp4),
             "format": {
                 "sample_rate": EXPECTED_SAMPLE_RATE,
@@ -668,34 +692,46 @@ def test_end_to_end_silent_sources_with_synthetic_video(
         )
 
         stopped = events[-1]
-        assert stopped["output_path"] == str(output_wav)
+        assert stopped["basename"] == str(output_basename)
+
+        # Spec 005: exactly two ``audio_file`` events accompany ``stopped``.
+        audio_file_events = [
+            ev for ev in events if ev.get("event") == "audio_file"
+        ]
+        assert len(audio_file_events) == 2, (
+            f"expected exactly 2 audio_file events, got "
+            f"{len(audio_file_events)}: {audio_file_events!r}"
+        )
 
         # ------------------------------------------------------------------
-        # File-pairing assertion (slice 2 acceptance criterion).
+        # File-pairing assertion (slice 2 acceptance criterion) — spec 005:
+        # both per-source WAVs land alongside the MP4 with the shared stem.
         # ------------------------------------------------------------------
-        assert output_wav.exists(), f"WAV not written to {output_wav}"
+        assert mic_wav.exists(), f"mic WAV not written to {mic_wav}"
+        assert system_wav.exists(), f"system WAV not written to {system_wav}"
         assert output_mp4.exists(), f"MP4 not written to {output_mp4}"
-        assert output_wav.stem == output_mp4.stem, (
-            f"wav stem {output_wav.stem!r} != mp4 stem {output_mp4.stem!r}"
+        assert mic_wav.name.startswith(stem), (
+            f"mic wav name {mic_wav.name!r} does not start with stem {stem!r}"
         )
 
         # ------------------------------------------------------------------
-        # WAV format + duration.
+        # WAV format + duration — both files.
         # ------------------------------------------------------------------
-        with wave.open(str(output_wav), "rb") as wf:
-            channels = wf.getnchannels()
-            framerate = wf.getframerate()
-            sampwidth = wf.getsampwidth()
-            nframes = wf.getnframes()
+        for wav_path in (mic_wav, system_wav):
+            with wave.open(str(wav_path), "rb") as wf:
+                channels = wf.getnchannels()
+                framerate = wf.getframerate()
+                sampwidth = wf.getsampwidth()
+                nframes = wf.getnframes()
 
-        assert channels == EXPECTED_CHANNELS
-        assert framerate == EXPECTED_SAMPLE_RATE
-        assert sampwidth == EXPECTED_SAMPWIDTH_BYTES
-        wav_duration = nframes / framerate
-        assert abs(wav_duration - CAPTURE_WINDOW_SECONDS) <= 0.5, (
-            f"WAV duration {wav_duration:.3f}s deviates from "
-            f"{CAPTURE_WINDOW_SECONDS}s by more than 500 ms"
-        )
+            assert channels == EXPECTED_CHANNELS
+            assert framerate == EXPECTED_SAMPLE_RATE
+            assert sampwidth == EXPECTED_SAMPWIDTH_BYTES
+            wav_duration = nframes / framerate
+            assert abs(wav_duration - CAPTURE_WINDOW_SECONDS) <= 0.5, (
+                f"{wav_path}: WAV duration {wav_duration:.3f}s deviates from "
+                f"{CAPTURE_WINDOW_SECONDS}s by more than 500 ms"
+            )
 
         # ------------------------------------------------------------------
         # MP4 opens cleanly + dimensions + duration.
@@ -862,9 +898,14 @@ def test_end_to_end_daemon_driven_start_stop(
         # ----- start -----------------------------------------------------
         start_resp = _send_control_request(socket_path, {"op": "start"})
         assert start_resp["status"] == "ok", start_resp
+        # Spec 005: ``audio_path`` carries the mic file (single-field surface);
+        # ``audio_paths`` carries both per-source paths.
         audio_path = Path(start_resp["audio_path"])
+        audio_paths = start_resp.get("audio_paths") or {}
+        system_audio_path = Path(audio_paths["system_audio"])
         video_path = Path(start_resp["video_path"])
         assert audio_path.parent == cwd_resolved, audio_path
+        assert system_audio_path.parent == cwd_resolved, system_audio_path
         assert video_path.parent == cwd_resolved, video_path
 
         # Let the synthetic capture run briefly so it produces real frames.
@@ -881,15 +922,22 @@ def test_end_to_end_daemon_driven_start_stop(
         )
         assert stop_resp["status"] == "ok", stop_resp
 
-        # Files materialised in the configured (CWD) directory.
-        assert audio_path.exists(), f"audio file missing at {audio_path}"
+        # Files materialised in the configured (CWD) directory — both per-source
+        # WAVs plus the MP4.
+        assert audio_path.exists(), f"mic audio file missing at {audio_path}"
+        assert system_audio_path.exists(), (
+            f"system audio file missing at {system_audio_path}"
+        )
         assert video_path.exists(), f"video file missing at {video_path}"
 
-        # capture-state.json should be finalized.
+        # capture-state.json should be finalized with the basename and the
+        # per-source ``audio_files`` map.
         assert state_path.exists()
         final_state = json.loads(state_path.read_text(encoding="utf-8"))
         assert final_state.get("final") is True, final_state
-        assert final_state.get("output_path") == str(audio_path)
+        files = final_state.get("audio_files") or {}
+        assert files.get("mic", {}).get("path") == str(audio_path)
+        assert files.get("system_audio", {}).get("path") == str(system_audio_path)
 
         # ----- quit ------------------------------------------------------
         quit_resp = _send_control_request(socket_path, {"op": "quit"})
@@ -1111,7 +1159,11 @@ def test_end_to_end_daemon_auto_transcription_on_finalize(
                 # ----- start ---------------------------------------------
                 start_resp = _send_control_request(socket_path, {"op": "start"})
                 assert start_resp["status"] == "ok", start_resp
+                # Spec 005: ``audio_path`` is the mic file; ``audio_paths`` is
+                # the per-source map.
                 audio_path = Path(start_resp["audio_path"])
+                audio_paths = start_resp.get("audio_paths") or {}
+                system_audio_path = Path(audio_paths["system_audio"])
                 assert audio_path.parent == cwd_resolved, audio_path
 
                 # Let the synthetic capture produce a beat of real frames.
@@ -1123,21 +1175,30 @@ def test_end_to_end_daemon_auto_transcription_on_finalize(
                 )
                 assert stop_resp["status"] == "ok", stop_resp
                 assert audio_path.exists()
+                assert system_audio_path.exists()
 
-                # ----- wait for the spawned transcription task ---------
+                # ----- wait for the spawned transcription tasks ----------
+                # One transcript triple per finalized WAV.
                 stem_dir = audio_path.parent
-                base = audio_path.stem
-                json_path = stem_dir / f"{base}.json"
-                txt_path = stem_dir / f"{base}.txt"
-                srt_path = stem_dir / f"{base}.srt"
+                expected_files: list[Path] = []
+                for wav_path in (audio_path, system_audio_path):
+                    base = wav_path.stem
+                    expected_files.extend(
+                        [
+                            stem_dir / f"{base}.json",
+                            stem_dir / f"{base}.txt",
+                            stem_dir / f"{base}.srt",
+                        ]
+                    )
 
-                got_all = _wait_for_files(
-                    [json_path, txt_path, srt_path], timeout=10.0
-                )
+                got_all = _wait_for_files(expected_files, timeout=10.0)
                 assert got_all, (
                     f"transcript files did not materialise within 10s; "
                     f"dir contents: {sorted(p.name for p in stem_dir.iterdir())!r}"
                 )
+
+                # Use the mic JSON for the canned-content sanity check.
+                json_path = stem_dir / f"{audio_path.stem}.json"
 
                 # Sanity-check the .json content. The stub's canned utterance
                 # carries "hello there" as the lone segment's text.
@@ -1290,9 +1351,14 @@ def test_end_to_end_daemon_driven_three_cycles(
             assert start_resp["status"] == "ok", (
                 f"cycle {cycle_idx}: start failed: {start_resp!r}"
             )
+            # Spec 005: ``audio_path`` is the mic file; ``audio_paths`` carries
+            # both per-source paths.
             audio_path = Path(start_resp["audio_path"])
+            audio_paths = start_resp.get("audio_paths") or {}
+            system_audio_path = Path(audio_paths["system_audio"])
             video_path = Path(start_resp["video_path"])
             assert audio_path.parent == cwd_resolved, audio_path
+            assert system_audio_path.parent == cwd_resolved, system_audio_path
             assert video_path.parent == cwd_resolved, video_path
 
             # Let the synthetic feed produce real frames for a beat.
@@ -1305,9 +1371,13 @@ def test_end_to_end_daemon_driven_three_cycles(
                 f"cycle {cycle_idx}: stop failed: {stop_resp!r}"
             )
 
-            # Per-cycle artifacts materialise.
+            # Per-cycle artifacts materialise — both per-source WAVs + MP4.
             assert audio_path.exists(), (
-                f"cycle {cycle_idx}: audio file missing at {audio_path}"
+                f"cycle {cycle_idx}: mic audio file missing at {audio_path}"
+            )
+            assert system_audio_path.exists(), (
+                f"cycle {cycle_idx}: system audio file missing at "
+                f"{system_audio_path}"
             )
             assert video_path.exists(), (
                 f"cycle {cycle_idx}: video file missing at {video_path}"
@@ -1315,14 +1385,22 @@ def test_end_to_end_daemon_driven_three_cycles(
             cycle_paths.append((audio_path, video_path))
 
             # capture-state.json is finalized + reflects THIS cycle's audio
-            # path (the daemon overwrites it per-capture).
+            # paths (the daemon overwrites it per-capture).
             assert state_path.exists()
             final_state = json.loads(state_path.read_text(encoding="utf-8"))
             assert final_state.get("final") is True, (
                 f"cycle {cycle_idx}: state not finalized: {final_state!r}"
             )
-            assert final_state.get("output_path") == str(audio_path), (
-                f"cycle {cycle_idx}: state.output_path mismatch: {final_state!r}"
+            files = final_state.get("audio_files") or {}
+            assert files.get("mic", {}).get("path") == str(audio_path), (
+                f"cycle {cycle_idx}: state.audio_files.mic.path mismatch: "
+                f"{final_state!r}"
+            )
+            assert files.get("system_audio", {}).get("path") == str(
+                system_audio_path
+            ), (
+                f"cycle {cycle_idx}: state.audio_files.system_audio.path "
+                f"mismatch: {final_state!r}"
             )
 
             # Record fd count. We sample once per cycle, after stop has
@@ -1331,6 +1409,9 @@ def test_end_to_end_daemon_driven_three_cycles(
             fds_after_cycle.append(daemon_psutil.num_fds())
 
         # All three pairs of files survive on disk and use distinct stems.
+        # Spec 005: the mic file's name is ``<timestamp>-mic.wav`` so its stem
+        # is ``<timestamp>-mic`` — strip the ``-mic`` suffix to compare against
+        # the video file's bare timestamp stem.
         all_audio_paths = [p[0] for p in cycle_paths]
         all_video_paths = [p[1] for p in cycle_paths]
         all_stems = {p.stem for p in all_audio_paths}
@@ -1344,7 +1425,7 @@ def test_end_to_end_daemon_driven_three_cycles(
             assert video_path.exists(), (
                 f"video path {video_path} disappeared between cycles"
             )
-            assert audio_path.stem == video_path.stem, (
+            assert audio_path.stem.removesuffix("-mic") == video_path.stem, (
                 f"per-cycle wav/mp4 stems do not match: "
                 f"{audio_path.stem!r} vs {video_path.stem!r}"
             )

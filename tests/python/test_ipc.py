@@ -23,6 +23,7 @@ import pytest
 from pydantic import ValidationError
 
 from record.ipc import (
+    AudioFileEvent,
     AudioFormat,
     CaptureEndedBySystemEventEvent,
     DisplayReconfiguredEvent,
@@ -85,6 +86,9 @@ EVENT_FIXTURES: list[tuple[str, type]] = [
     ("video_started.json", VideoStartedEvent),
     ("video_lost.json", VideoLostEvent),
     ("video_file.json", VideoFileEvent),
+    ("audio_file_captured_normally.json", AudioFileEvent),
+    ("audio_file_silent_throughout.json", AudioFileEvent),
+    ("audio_file_truncated_at_offset.json", AudioFileEvent),
     ("display_reconfigured.json", DisplayReconfiguredEvent),
     ("capture_ended_by_system_event.json", CaptureEndedBySystemEventEvent),
     ("hotkey_registered.json", HotkeyRegisteredEvent),
@@ -125,7 +129,7 @@ def test_event_fixture_round_trip(filename: str, model_cls: type) -> None:
 def test_start_command_object_round_trip() -> None:
     """Build the model via constructor → serialize → parse → assert equality."""
     cmd = StartCommand(
-        output_path="/abs/path/to/2026-05-10T14-32-08.wav",
+        output_path="/abs/path/to/2026-05-10T14-32-08",
         format=AudioFormat(sample_rate=16000, bit_depth=16, channels=1),
     )
     line = serialize_command(cmd)
@@ -136,7 +140,7 @@ def test_start_command_object_round_trip() -> None:
 def test_start_command_with_video_object_round_trip() -> None:
     """``StartCommand`` with both video fields populated round-trips end-to-end."""
     cmd = StartCommand(
-        output_path="/abs/path/to/2026-05-10T14-32-08.wav",
+        output_path="/abs/path/to/2026-05-10T14-32-08",
         format=AudioFormat(sample_rate=16000, bit_depth=16, channels=1),
         video_output_path="/abs/path/to/2026-05-10T14-32-08.mp4",
         video=VideoConfig(fps=30, show_cursor=True),
@@ -146,7 +150,7 @@ def test_start_command_with_video_object_round_trip() -> None:
     assert parsed == cmd
     # Bonus: serializer omits video keys when they're None (audio-only run).
     audio_only = StartCommand(
-        output_path="/abs/x.wav",
+        output_path="/abs/x",
         format=AudioFormat(sample_rate=16000, bit_depth=16, channels=1),
     )
     audio_only_line = serialize_command(audio_only)
@@ -205,6 +209,77 @@ def test_video_file_event_object_round_trip() -> None:
     line = serialize_event(evt)
     parsed = parse_event(line)
     assert parsed == evt
+
+
+# ---------------------------------------------------------------------------
+# AudioFileEvent (spec 005 slice 1)
+# ---------------------------------------------------------------------------
+
+
+def test_audio_file_event_object_round_trip_captured_normally() -> None:
+    evt = AudioFileEvent(
+        path="/abs/path/to/2026-05-10T14-32-08-mic.wav",
+        source="mic",
+        duration_seconds=312.4,
+        status="captured_normally",
+    )
+    assert evt.truncated_at_offset_seconds is None
+    line = serialize_event(evt)
+    parsed = parse_event(line)
+    assert parsed == evt
+
+
+@pytest.mark.parametrize(
+    "source,status,duration,truncated_at",
+    [
+        ("mic", "captured_normally", 312.4, None),
+        ("system_audio", "silent_throughout", 312.4, None),
+        ("mic", "truncated_at_offset", 134.2, 134.2),
+        ("system_audio", "truncated_at_offset", 42.0, 42.0),
+    ],
+)
+def test_audio_file_event_round_trip_across_statuses(
+    source: str, status: str, duration: float, truncated_at: float | None
+) -> None:
+    evt = AudioFileEvent(
+        path=f"/abs/path/to/2026-05-10T14-32-08-{source}.wav",
+        source=source,  # type: ignore[arg-type]
+        duration_seconds=duration,
+        status=status,  # type: ignore[arg-type]
+        truncated_at_offset_seconds=truncated_at,
+    )
+    line = serialize_event(evt)
+    parsed = parse_event(line)
+    assert parsed == evt
+
+
+def test_audio_file_event_rejects_unknown_status() -> None:
+    line = (
+        '{"event":"audio_file","path":"/x.wav","source":"mic",'
+        '"duration_seconds":1.0,"status":"made_up","truncated_at_offset_seconds":null}'
+    )
+    with pytest.raises((ValidationError, ValueError)):
+        parse_event(line)
+
+
+def test_audio_file_event_rejects_unknown_source() -> None:
+    line = (
+        '{"event":"audio_file","path":"/x.wav","source":"speakers",'
+        '"duration_seconds":1.0,"status":"captured_normally",'
+        '"truncated_at_offset_seconds":null}'
+    )
+    with pytest.raises((ValidationError, ValueError)):
+        parse_event(line)
+
+
+def test_audio_file_event_rejects_missing_required_field() -> None:
+    # Missing ``duration_seconds``.
+    line = (
+        '{"event":"audio_file","path":"/x.wav","source":"mic",'
+        '"status":"captured_normally","truncated_at_offset_seconds":null}'
+    )
+    with pytest.raises((ValidationError, ValueError)):
+        parse_event(line)
 
 
 @pytest.mark.parametrize(

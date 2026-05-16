@@ -1,7 +1,8 @@
 # Functional Specification: Mixed Mic + System Audio Capture
 
 - **Roadmap Item:** Mixed mic + system audio capture (Phase 1 — Capture Foundation)
-- **Status:** Draft
+- **Status:** Superseded
+- **Superseded by:** [005 — Independent Mic and System Audio WAV Files](../005-independent-mic-system-wav-files/functional-spec.md)
 - **Author:** e
 
 ---

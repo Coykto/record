@@ -88,6 +88,17 @@ struct CLIFlags {
     /// caches at process launch, so a *fresh* process is the only way to observe
     /// a grant made after priming started.
     var checkScreenRecording: Bool = false
+    /// When non-nil, schedule `AudioCapture.handleMicLost(...)` N seconds
+    /// after sources start. Only meaningful in synthetic-audio mode
+    /// (`--test-silent-sources`); in production mode the value is parsed but
+    /// nothing wires it up — the real mic loss path is driven by the OS.
+    /// Drives the slice 3 integration test for mid-capture mic truncation.
+    var injectMicLossAfterSeconds: Double? = nil
+    /// When true, the synthetic feeder writes all-zero Int16 samples on the
+    /// mic side (system side keeps its 880 Hz tone). Only meaningful in
+    /// synthetic-audio mode (`--test-silent-sources`). Drives the slice 4
+    /// integration test for `status="silent_throughout"`.
+    var silentMicSource: Bool = false
 }
 
 /// Parse CLI flags before any IPC begins. Supported flags:
@@ -148,6 +159,21 @@ func parseCLIFlags() -> CLIFlags {
             }
             flags.simulateVideoFailureAfterSeconds = value
             i += 2
+        case "--inject-mic-loss-after-seconds":
+            guard i + 1 < args.count else {
+                emitCLIFlagErrorAndExit(message: "--inject-mic-loss-after-seconds requires a numeric argument")
+            }
+            let raw = args[i + 1]
+            guard let value = Double(raw), value.isFinite, value >= 0 else {
+                emitCLIFlagErrorAndExit(message: "--inject-mic-loss-after-seconds: invalid value '\(raw)' (expected non-negative number)")
+            }
+            flags.injectMicLossAfterSeconds = value
+            i += 2
+        case "--silent-mic-source":
+            // Order-independent boolean flag. Only meaningful with
+            // `--test-silent-sources`; in production mode it's a no-op.
+            flags.silentMicSource = true
+            i += 1
         default:
             emitCLIFlagErrorAndExit(message: "unknown CLI flag: \(arg)")
         }
@@ -272,7 +298,10 @@ final class CaptureState {
     let videoSource: VideoSource?
     let displayMonitor: DisplayReconfigurationMonitor?
     let systemEventMonitor: SystemEventMonitor?
-    let outputPath: String
+    /// Audio output basename (no extension). The two per-source WAVs are
+    /// `<basename>-mic.wav` and `<basename>-system.wav`; the basename itself
+    /// is carried back to the orchestrator on the `stopped` event.
+    let basename: String
     let videoOutputPath: String?
     let startedAt: Date
 
@@ -288,7 +317,7 @@ final class CaptureState {
         videoSource: VideoSource?,
         displayMonitor: DisplayReconfigurationMonitor?,
         systemEventMonitor: SystemEventMonitor?,
-        outputPath: String,
+        basename: String,
         videoOutputPath: String?,
         startedAt: Date
     ) {
@@ -296,7 +325,7 @@ final class CaptureState {
         self.videoSource = videoSource
         self.displayMonitor = displayMonitor
         self.systemEventMonitor = systemEventMonitor
-        self.outputPath = outputPath
+        self.basename = basename
         self.videoOutputPath = videoOutputPath
         self.startedAt = startedAt
     }
@@ -369,14 +398,18 @@ func handleStart(
         return
     }
 
-    let url = URL(fileURLWithPath: outputPath)
+    // `outputPath` on the wire is now a basename without extension; the
+    // capture backend derives `<basename>-mic.wav` and `<basename>-system.wav`.
+    let basenameURL = URL(fileURLWithPath: outputPath)
 
     let audioCapture: AudioCapture
     do {
         audioCapture = try AudioCapture(
-            outputURL: url,
+            basename: basenameURL,
             emit: emit,
-            testSilentSources: testSilentSources
+            testSilentSources: testSilentSources,
+            injectMicLossAfterSeconds: cliFlags.injectMicLossAfterSeconds,
+            silentMicSource: cliFlags.silentMicSource
         )
     } catch {
         emit(.error(message: "failed to construct AudioCapture: \(error)"))
@@ -565,7 +598,7 @@ func handleStart(
                 videoSource: videoSource,
                 displayMonitor: displayMonitor,
                 systemEventMonitor: systemEventMonitor,
-                outputPath: outputPath,
+                basename: outputPath,
                 videoOutputPath: videoOutputPath,
                 startedAt: startedAt
             )
@@ -683,7 +716,7 @@ func handleStop() {
             ))
         }
 
-        emit(.stopped(durationSeconds: audioDur, outputPath: state.outputPath))
+        emit(.stopped(durationSeconds: audioDur, basename: state.basename))
 
         if daemonMode {
             // Daemon mode: keep the process alive and reset for the next

@@ -60,6 +60,12 @@ enum HotkeyRegistrationStatus: String, Codable, Equatable {
 /// Discriminator is the `cmd` field. Unknown values throw a decoding error
 /// so that callers can surface a clean `error` event upstream.
 enum Command: Equatable {
+    /// Begin a capture.
+    ///
+    /// - `outputPath`: absolute path basename without extension; the daemon
+    ///   appends `-mic.wav` and `-system.wav` to derive the two audio file
+    ///   paths. The JSON wire key is `output_path` (unchanged from spec 001)
+    ///   but its semantics are now "basename", not "full path".
     case start(outputPath: String, videoOutputPath: String?, format: AudioFormat, video: VideoConfig?)
     case stop
     case shutdown
@@ -179,11 +185,17 @@ enum Event: Equatable {
     case started(startTime: String)
     case sourceAttached(source: SourceKind)
     case sourceLost(source: SourceKind, atOffsetSeconds: Double, reason: String)
-    case stopped(durationSeconds: Double, outputPath: String)
+    case stopped(durationSeconds: Double, basename: String)
     case error(message: String)
     case videoStarted(displayId: Int, widthPx: Int, heightPx: Int, fps: Int)
     case videoLost(atOffsetSeconds: Double, reason: String, message: String)
     case videoFile(path: String, durationSeconds: Double)
+    /// Emitted once per finalized audio WAV file. `source` identifies the
+    /// originating capture pipeline; `status` is one of
+    /// `"captured_normally"`, `"silent_throughout"`, `"truncated_at_offset"`.
+    /// `truncatedAtOffsetSeconds` is populated only when
+    /// `status == "truncated_at_offset"` and otherwise nil.
+    case audioFile(path: String, source: SourceKind, durationSeconds: Double, status: String, truncatedAtOffsetSeconds: Double?)
     case displayReconfigured(reason: DisplayReconfigurationReason, newDisplayId: Int, newWidthPx: Int, newHeightPx: Int)
     case captureEndedBySystemEvent(reason: SystemEventReason, atOffsetSeconds: Double)
     /// Outcome of a `register_hotkey` command. `message` is always present
@@ -206,7 +218,7 @@ enum Event: Equatable {
         case atOffsetSeconds = "at_offset_seconds"
         case reason
         case durationSeconds = "duration_seconds"
-        case outputPath = "output_path"
+        case basename
         case message
         case displayId = "display_id"
         case widthPx = "width_px"
@@ -219,6 +231,7 @@ enum Event: Equatable {
         case status
         case modifiers
         case key
+        case truncatedAtOffsetSeconds = "truncated_at_offset_seconds"
     }
 
     private enum EventKind: String, Codable {
@@ -233,6 +246,7 @@ enum Event: Equatable {
         case videoStarted = "video_started"
         case videoLost = "video_lost"
         case videoFile = "video_file"
+        case audioFile = "audio_file"
         case displayReconfigured = "display_reconfigured"
         case captureEndedBySystemEvent = "capture_ended_by_system_event"
         case hotkeyRegistered = "hotkey_registered"
@@ -267,8 +281,8 @@ extension Event: Codable {
             self = .sourceLost(source: s, atOffsetSeconds: off, reason: reason)
         case .stopped:
             let d = try container.decode(Double.self, forKey: .durationSeconds)
-            let p = try container.decode(String.self, forKey: .outputPath)
-            self = .stopped(durationSeconds: d, outputPath: p)
+            let p = try container.decode(String.self, forKey: .basename)
+            self = .stopped(durationSeconds: d, basename: p)
         case .error:
             let m = try container.decode(String.self, forKey: .message)
             self = .error(message: m)
@@ -287,6 +301,13 @@ extension Event: Codable {
             let p = try container.decode(String.self, forKey: .path)
             let d = try container.decode(Double.self, forKey: .durationSeconds)
             self = .videoFile(path: p, durationSeconds: d)
+        case .audioFile:
+            let p = try container.decode(String.self, forKey: .path)
+            let s = try container.decode(SourceKind.self, forKey: .source)
+            let d = try container.decode(Double.self, forKey: .durationSeconds)
+            let st = try container.decode(String.self, forKey: .status)
+            let t = try container.decodeIfPresent(Double.self, forKey: .truncatedAtOffsetSeconds)
+            self = .audioFile(path: p, source: s, durationSeconds: d, status: st, truncatedAtOffsetSeconds: t)
         case .displayReconfigured:
             let r = try container.decode(DisplayReconfigurationReason.self, forKey: .reason)
             let id = try container.decode(Int.self, forKey: .newDisplayId)
@@ -332,10 +353,10 @@ extension Event: Codable {
             try container.encode(source, forKey: .source)
             try container.encode(offset, forKey: .atOffsetSeconds)
             try container.encode(reason, forKey: .reason)
-        case .stopped(let duration, let path):
+        case .stopped(let duration, let basename):
             try container.encode(EventKind.stopped, forKey: .event)
             try container.encode(duration, forKey: .durationSeconds)
-            try container.encode(path, forKey: .outputPath)
+            try container.encode(basename, forKey: .basename)
         case .error(let message):
             try container.encode(EventKind.error, forKey: .event)
             try container.encode(message, forKey: .message)
@@ -354,6 +375,13 @@ extension Event: Codable {
             try container.encode(EventKind.videoFile, forKey: .event)
             try container.encode(path, forKey: .path)
             try container.encode(duration, forKey: .durationSeconds)
+        case .audioFile(let path, let source, let duration, let status, let truncatedAtOffsetSeconds):
+            try container.encode(EventKind.audioFile, forKey: .event)
+            try container.encode(path, forKey: .path)
+            try container.encode(source, forKey: .source)
+            try container.encode(duration, forKey: .durationSeconds)
+            try container.encode(status, forKey: .status)
+            try container.encodeIfPresent(truncatedAtOffsetSeconds, forKey: .truncatedAtOffsetSeconds)
         case .displayReconfigured(let reason, let newDisplayId, let newWidthPx, let newHeightPx):
             try container.encode(EventKind.displayReconfigured, forKey: .event)
             try container.encode(reason, forKey: .reason)

@@ -146,7 +146,21 @@ def test_state_round_trip(tmp_path: Path) -> None:
     target = tmp_path / "capture-state.json"
     payload = {
         "pid": 1234,
-        "output_path": "/abs/x.wav",
+        "basename": "/abs/x",
+        "audio_files": {
+            "mic": {
+                "path": "/abs/x-mic.wav",
+                "status": "captured_normally",
+                "duration_seconds": 1.0,
+                "truncated_at_offset_seconds": None,
+            },
+            "system_audio": {
+                "path": "/abs/x-system.wav",
+                "status": "captured_normally",
+                "duration_seconds": 1.0,
+                "truncated_at_offset_seconds": None,
+            },
+        },
         "sources": {"mic": {"status": "attached"}},
         "warnings": [],
         "final": False,
@@ -227,8 +241,22 @@ def _initial_state_like() -> dict[str, Any]:
     return {
         "pid": 1234,
         "start_time": None,
-        "output_path": None,
+        "basename": None,
         "video_output_path": None,
+        "audio_files": {
+            "mic": {
+                "path": None,
+                "status": "pending",
+                "duration_seconds": None,
+                "truncated_at_offset_seconds": None,
+            },
+            "system_audio": {
+                "path": None,
+                "status": "pending",
+                "duration_seconds": None,
+                "truncated_at_offset_seconds": None,
+            },
+        },
         "sources": {
             "mic": {
                 "status": "never_attached",

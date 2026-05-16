@@ -36,7 +36,7 @@ _log = get_logger("record.supervisor")
 
 async def _run_session(
     *,
-    output_path: Path,
+    basename: Path,
     sample_rate: int,
     bit_depth: int,
     channels: int,
@@ -48,7 +48,7 @@ async def _run_session(
     Returns the desired process exit code so :func:`main` can sys.exit it.
     """
     session = CaptureSession(
-        output_path=output_path,
+        basename=basename,
         video_output_path=video_output_path,
         sample_rate=sample_rate,
         bit_depth=bit_depth,
@@ -128,7 +128,7 @@ async def _run_session(
 
 
 def run(
-    output_path: Path,
+    basename: Path,
     sample_rate: int,
     bit_depth: int,
     channels: int,
@@ -140,7 +140,7 @@ def run(
 
     _log.info(
         "supervisor_starting",
-        output_path=str(output_path),
+        basename=str(basename),
         video_output_path=str(video_output_path) if video_output_path else None,
         pid=os.getpid(),
     )
@@ -148,7 +148,7 @@ def run(
     try:
         rc = asyncio.run(
             _run_session(
-                output_path=output_path,
+                basename=basename,
                 sample_rate=sample_rate,
                 bit_depth=bit_depth,
                 channels=channels,
@@ -198,10 +198,13 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Legacy foreground supervisor for the Swift capture binary.",
     )
     parser.add_argument(
-        "--output-path",
+        "--basename",
         required=True,
         type=Path,
-        help="Absolute path of the WAV file the binary will eventually write.",
+        help=(
+            "Absolute basename (no extension) for the recording — the daemon "
+            "appends -mic.wav and -system.wav"
+        ),
     )
     parser.add_argument(
         "--video-output-path",
@@ -221,14 +224,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    output_path = args.output_path
-    if not output_path.is_absolute():
-        output_path = output_path.resolve()
+    basename = args.basename
+    if not basename.is_absolute():
+        basename = basename.resolve()
     video_output_path: Path | None = args.video_output_path
     if video_output_path is not None and not video_output_path.is_absolute():
         video_output_path = video_output_path.resolve()
     return run(
-        output_path=output_path,
+        basename=basename,
         sample_rate=args.sample_rate,
         bit_depth=args.bit_depth,
         channels=args.channels,

@@ -201,6 +201,15 @@ class ControlResponse(BaseModel):
     capture_id: str | None = None
     audio_path: str | None = None
     video_path: str | None = None
+    audio_paths: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Per-source audio file paths keyed by source name "
+            "('mic', 'system_audio'). Populated on start/stop replies; "
+            "supersedes the single 'audio_path' field which is kept for "
+            "backwards compatibility and carries the mic path."
+        ),
+    )
 
     # status payload (tech spec §2.6)
     daemon: DaemonInfo | None = None

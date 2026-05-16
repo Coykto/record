@@ -145,7 +145,7 @@ class Daemon:
         # the daemon simply skips registration (legacy slice-2/4 behavior).
         self._config: Config | None = config
 
-        # session_factory: callable taking (output_path, video_output_path) →
+        # session_factory: callable taking (basename, video_output_path) →
         # CaptureSession-like. Default uses the real session.
         if session_factory is None:
             session_factory = self._default_session_factory
@@ -183,10 +183,10 @@ class Daemon:
     # ----- Factory --------------------------------------------------------
 
     def _default_session_factory(
-        self, output_path: Path, video_output_path: Path | None
+        self, basename: Path, video_output_path: Path | None
     ) -> CaptureSession:
         return CaptureSession(
-            output_path=output_path,
+            basename=basename,
             video_output_path=video_output_path,
             sample_rate=_SAMPLE_RATE,
             bit_depth=_BIT_DEPTH,
@@ -306,10 +306,10 @@ class Daemon:
         # nothing else is happening to _session right now.
         stem = _filename_timestamp()
         base = self._output_folder if self._output_folder is not None else Path.cwd()
-        output_path = (base / f"{stem}.wav").resolve()
+        basename = (base / stem).resolve()
         video_output_path = (base / f"{stem}.mp4").resolve()
 
-        session = self._session_factory(output_path, video_output_path)
+        session = self._session_factory(basename, video_output_path)
 
         try:
             await session.start()
@@ -352,10 +352,16 @@ class Daemon:
         # (hotkey or socket-driven ``record start``).
         self._safe_play_start()
 
+        # Spec 005: capture now produces two WAVs derived from the basename.
+        # Surface both via ``audio_paths`` and keep ``audio_path`` populated
+        # with the mic file for the existing single-field CLI surface.
+        mic_path = str(basename) + "-mic.wav"
+        system_path = str(basename) + "-system.wav"
         return control.ControlResponse(
             status="ok",
             capture_id=stem,
-            audio_path=str(output_path),
+            audio_path=mic_path,
+            audio_paths={"mic": mic_path, "system_audio": system_path},
             video_path=str(video_output_path),
         )
 
@@ -378,16 +384,21 @@ class Daemon:
                 return
             self._state = _CaptureState.STOPPING
 
-        finalized_audio: str | None = None
+        finalized_audio_paths: list[str] = []
         try:
             final = await session.stop()
         except Exception as exc:  # pragma: no cover - defensive
             self._log.exception("capture_system_event_stop_failed", error=str(exc))
             final = None
         else:
-            audio_value = final.get("output_path") if isinstance(final, dict) else None
-            if isinstance(audio_value, str):
-                finalized_audio = audio_value
+            if isinstance(final, dict):
+                files = final.get("audio_files") or {}
+                if isinstance(files, dict):
+                    for entry in files.values():
+                        if isinstance(entry, dict):
+                            p = entry.get("path")
+                            if isinstance(p, str):
+                                finalized_audio_paths.append(p)
 
         async with self._lock:
             self._session = None
@@ -399,8 +410,9 @@ class Daemon:
         # auto-transcription as an explicit ``record stop``. Spawn after the
         # capture has been confirmed finalized and the state has unwound to
         # IDLE (a transcription failure must never trap the state machine).
-        if finalized_audio is not None:
-            self._spawn_transcription(Path(finalized_audio))
+        # Spec 005: two WAVs per session — kick off one transcription per file.
+        for audio_str in finalized_audio_paths:
+            self._spawn_transcription(Path(audio_str))
 
     # ----- Hotkey routing (slice 5) ---------------------------------------
 
@@ -668,19 +680,29 @@ class Daemon:
         # RUNNING→IDLE regardless of input channel.
         self._safe_play_stop()
 
-        # Spec 004 slice 2: kick off auto-transcription. Fire-and-forget — the
-        # control reply must not wait on Deepgram. ``_spawn_transcription`` is
-        # safe to call without a configured key (it logs and returns).
-        audio_path_str = final.get("output_path")
-        if isinstance(audio_path_str, str):
-            self._spawn_transcription(Path(audio_path_str))
+        # Spec 004 slice 2 + spec 005: kick off auto-transcription per file.
+        # Fire-and-forget — the control reply must not wait on Deepgram.
+        # ``_spawn_transcription`` is safe to call without a configured key
+        # (it logs and returns). With independent mic / system files we now
+        # spawn one transcription per produced WAV.
+        audio_paths_map: dict[str, str] = {}
+        files = final.get("audio_files") or {}
+        if isinstance(files, dict):
+            for source_name, entry in files.items():
+                if isinstance(entry, dict):
+                    p = entry.get("path")
+                    if isinstance(p, str):
+                        audio_paths_map[source_name] = p
+                        self._spawn_transcription(Path(p))
 
         # Confirm the final state was persisted (CaptureSession set final=True
         # before returning). The CLI re-reads `capture-state.json` to print
-        # the same summary the legacy stop did.
+        # the same summary the legacy stop did. Mic file is the single-field
+        # surface for backwards compatibility; ``audio_paths`` carries both.
         return control.ControlResponse(
             status="ok",
-            audio_path=final.get("output_path"),
+            audio_path=audio_paths_map.get("mic"),
+            audio_paths=audio_paths_map or None,
             video_path=final.get("video_output_path"),
         )
 
@@ -780,7 +802,13 @@ class Daemon:
                     duration = (datetime.now(timezone.utc) - started_dt).total_seconds()
                 except ValueError:  # pragma: no cover - defensive
                     duration = None
-            audio_path = session_state.get("output_path")
+            # Spec 005: status surfaces only the mic-side path on its single
+            # ``audio_path`` field; both files are listed in the stop summary.
+            audio_files = session_state.get("audio_files") or {}
+            mic_entry = audio_files.get("mic") if isinstance(audio_files, dict) else None
+            audio_path = (
+                mic_entry.get("path") if isinstance(mic_entry, dict) else None
+            )
             video_path = session_state.get("video_output_path")
             capture = control.CaptureState(
                 running=True,
