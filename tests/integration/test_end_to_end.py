@@ -939,6 +939,38 @@ def test_end_to_end_daemon_driven_start_stop(
         assert files.get("mic", {}).get("path") == str(audio_path)
         assert files.get("system_audio", {}).get("path") == str(system_audio_path)
 
+        # Spec 007: daemon produces a combined WAV next to the source files,
+        # named ``<timestamp>.wav`` (the mic stem with the ``-mic`` suffix
+        # stripped). It surfaces in ``capture-state.json`` under
+        # ``combined_audio``.
+        combined_stem = audio_path.stem.removesuffix("-mic")
+        combined_path = audio_path.parent / f"{combined_stem}.wav"
+        assert combined_path.exists(), (
+            f"combined audio file missing at {combined_path}"
+        )
+        with wave.open(str(combined_path), "rb") as cwf:
+            assert cwf.getnchannels() == EXPECTED_CHANNELS
+            assert cwf.getframerate() == EXPECTED_SAMPLE_RATE
+            assert cwf.getsampwidth() == EXPECTED_SAMPWIDTH_BYTES
+            combined_nframes = cwf.getnframes()
+        assert combined_nframes > 0, (
+            f"combined WAV {combined_path} has zero frames"
+        )
+        combined_duration = combined_nframes / EXPECTED_SAMPLE_RATE
+        with wave.open(str(audio_path), "rb") as mwf:
+            mic_duration = mwf.getnframes() / mwf.getframerate()
+        with wave.open(str(system_audio_path), "rb") as swf:
+            system_duration = swf.getnframes() / swf.getframerate()
+        longer_source = max(mic_duration, system_duration)
+        assert abs(combined_duration - longer_source) <= 0.1, (
+            f"combined duration {combined_duration:.3f}s deviates from longer "
+            f"source {longer_source:.3f}s by more than 100 ms"
+        )
+
+        combined_state = final_state.get("combined_audio") or {}
+        assert combined_state.get("status") == "produced", combined_state
+        assert combined_state.get("path") == str(combined_path), combined_state
+
         # ----- quit ------------------------------------------------------
         quit_resp = _send_control_request(socket_path, {"op": "quit"})
         assert quit_resp["status"] == "ok"
@@ -1177,19 +1209,41 @@ def test_end_to_end_daemon_auto_transcription_on_finalize(
                 assert audio_path.exists()
                 assert system_audio_path.exists()
 
-                # ----- wait for the spawned transcription tasks ----------
-                # One transcript triple per finalized WAV.
+                # Spec 007: the daemon now produces a combined WAV next to the
+                # per-source files and transcribes that combined file only.
                 stem_dir = audio_path.parent
-                expected_files: list[Path] = []
-                for wav_path in (audio_path, system_audio_path):
-                    base = wav_path.stem
-                    expected_files.extend(
-                        [
-                            stem_dir / f"{base}.json",
-                            stem_dir / f"{base}.txt",
-                            stem_dir / f"{base}.srt",
-                        ]
-                    )
+                combined_stem = audio_path.stem.removesuffix("-mic")
+                combined_path = stem_dir / f"{combined_stem}.wav"
+                assert combined_path.exists(), (
+                    f"combined audio file missing at {combined_path}"
+                )
+                with wave.open(str(combined_path), "rb") as cwf:
+                    assert cwf.getnchannels() == EXPECTED_CHANNELS
+                    assert cwf.getframerate() == EXPECTED_SAMPLE_RATE
+                    assert cwf.getsampwidth() == EXPECTED_SAMPWIDTH_BYTES
+                    combined_nframes = cwf.getnframes()
+                assert combined_nframes > 0, (
+                    f"combined WAV {combined_path} has zero frames"
+                )
+                combined_duration = combined_nframes / EXPECTED_SAMPLE_RATE
+                with wave.open(str(audio_path), "rb") as mwf:
+                    mic_duration = mwf.getnframes() / mwf.getframerate()
+                with wave.open(str(system_audio_path), "rb") as swf:
+                    system_duration = swf.getnframes() / swf.getframerate()
+                longer_source = max(mic_duration, system_duration)
+                assert abs(combined_duration - longer_source) <= 0.1, (
+                    f"combined duration {combined_duration:.3f}s deviates from "
+                    f"longer source {longer_source:.3f}s by more than 100 ms"
+                )
+
+                # ----- wait for the spawned transcription task -----------
+                # Spec 007: exactly one transcript triple per session, derived
+                # from the combined WAV.
+                expected_files: list[Path] = [
+                    stem_dir / f"{combined_stem}.json",
+                    stem_dir / f"{combined_stem}.txt",
+                    stem_dir / f"{combined_stem}.srt",
+                ]
 
                 got_all = _wait_for_files(expected_files, timeout=10.0)
                 assert got_all, (
@@ -1197,11 +1251,19 @@ def test_end_to_end_daemon_auto_transcription_on_finalize(
                     f"dir contents: {sorted(p.name for p in stem_dir.iterdir())!r}"
                 )
 
-                # Use the mic JSON for the canned-content sanity check.
-                json_path = stem_dir / f"{audio_path.stem}.json"
+                # Per-source transcript files must NOT appear. Pins the
+                # regression: a future leak that re-introduces per-source
+                # transcription would otherwise pass quietly.
+                for source_wav in (audio_path, system_audio_path):
+                    leaked = stem_dir / f"{source_wav.stem}.json"
+                    assert not leaked.exists(), (
+                        f"unexpected per-source transcript {leaked} — spec 007 "
+                        f"transcribes the combined file only"
+                    )
 
-                # Sanity-check the .json content. The stub's canned utterance
-                # carries "hello there" as the lone segment's text.
+                # Sanity-check the combined .json content. The stub's canned
+                # utterance carries "hello there" as the lone segment's text.
+                json_path = stem_dir / f"{combined_stem}.json"
                 payload = json.loads(json_path.read_text(encoding="utf-8"))
                 assert payload["provider"] == "deepgram"
                 assert payload["model"] == "nova-3"
@@ -1344,6 +1406,7 @@ def test_end_to_end_daemon_driven_three_cycles(
         baseline_fds = daemon_psutil.num_fds()
 
         cycle_paths: list[tuple[Path, Path]] = []
+        combined_paths: list[Path] = []
         fds_after_cycle: list[int] = []
 
         for cycle_idx in range(3):
@@ -1403,6 +1466,46 @@ def test_end_to_end_daemon_driven_three_cycles(
                 f"mismatch: {final_state!r}"
             )
 
+            # Spec 007: combined WAV lands alongside the per-source files
+            # and is reflected in ``capture-state.json``.
+            combined_stem = audio_path.stem.removesuffix("-mic")
+            combined_path = audio_path.parent / f"{combined_stem}.wav"
+            assert combined_path.exists(), (
+                f"cycle {cycle_idx}: combined audio file missing at "
+                f"{combined_path}"
+            )
+            with wave.open(str(combined_path), "rb") as cwf:
+                assert cwf.getnchannels() == EXPECTED_CHANNELS
+                assert cwf.getframerate() == EXPECTED_SAMPLE_RATE
+                assert cwf.getsampwidth() == EXPECTED_SAMPWIDTH_BYTES
+                combined_nframes = cwf.getnframes()
+            assert combined_nframes > 0, (
+                f"cycle {cycle_idx}: combined WAV {combined_path} has zero "
+                f"frames"
+            )
+            combined_duration = combined_nframes / EXPECTED_SAMPLE_RATE
+            with wave.open(str(audio_path), "rb") as mwf:
+                mic_duration = mwf.getnframes() / mwf.getframerate()
+            with wave.open(str(system_audio_path), "rb") as swf:
+                system_duration = swf.getnframes() / swf.getframerate()
+            longer_source = max(mic_duration, system_duration)
+            assert abs(combined_duration - longer_source) <= 0.1, (
+                f"cycle {cycle_idx}: combined duration "
+                f"{combined_duration:.3f}s deviates from longer source "
+                f"{longer_source:.3f}s by more than 100 ms"
+            )
+
+            combined_state = final_state.get("combined_audio") or {}
+            assert combined_state.get("status") == "produced", (
+                f"cycle {cycle_idx}: combined_audio not produced: "
+                f"{final_state!r}"
+            )
+            assert combined_state.get("path") == str(combined_path), (
+                f"cycle {cycle_idx}: combined_audio.path mismatch: "
+                f"{final_state!r}"
+            )
+            combined_paths.append(combined_path)
+
             # Record fd count. We sample once per cycle, after stop has
             # fully unwound — that's the cleanest moment to compare across
             # cycles because no transient asyncio pipes are open.
@@ -1417,6 +1520,11 @@ def test_end_to_end_daemon_driven_three_cycles(
         all_stems = {p.stem for p in all_audio_paths}
         assert len(all_stems) == 3, (
             f"expected 3 distinct filename stems, got {sorted(all_stems)!r}"
+        )
+        combined_stems = {p.stem for p in combined_paths}
+        assert len(combined_stems) == 3, (
+            f"expected 3 distinct combined-WAV stems, got "
+            f"{sorted(combined_stems)!r}"
         )
         for audio_path, video_path in cycle_paths:
             assert audio_path.exists(), (

@@ -313,6 +313,8 @@ def test_stop_happy_path_renders_summary_from_state_file(
             '"duration_seconds": 42.5, "truncated_at_offset_seconds": null}, '
             '"system_audio": {"path": "/abs/x-system.wav", "status": "captured_normally", '
             '"duration_seconds": 42.5, "truncated_at_offset_seconds": null}}, '
+            '"combined_audio": {"path": "/abs/x.wav", "status": "produced", '
+            '"duration_seconds": 42.5}, '
             '"sources": {"mic": {"status": "attached"}, '
             '"system_audio": {"status": "attached"}, '
             '"video": {"status": "never_attached"}}, '
@@ -341,6 +343,9 @@ def test_stop_happy_path_renders_summary_from_state_file(
     assert "/abs/x-system.wav" in result.stdout
     assert "captured normally" in result.stdout
     assert "microphone + system audio" in result.stdout
+    # Spec 007 slice 2: the combined-file line is rendered on success.
+    assert "combined: /abs/x.wav" in result.stdout
+    assert "produced" in result.stdout
 
 
 def test_stop_summary_renders_truncated_at_offset_for_mic(
@@ -377,6 +382,86 @@ def test_humanize_audio_file_status_truncated_at_offset_without_seconds() -> Non
 def test_humanize_audio_file_status_silent_throughout() -> None:
     """A silent_throughout status renders the literal label 'silent throughout'."""
     assert cli._humanize_audio_file_status("silent_throughout") == "silent throughout"
+
+
+# ---------------------------------------------------------------------------
+# Spec 007 slice 2: combined-file summary line
+# ---------------------------------------------------------------------------
+
+
+def _base_final(combined_audio: dict | None) -> dict:
+    """Minimal ``final`` payload for `_print_stop_summary` rendering tests."""
+    final: dict = {
+        "basename": "/abs/x",
+        "duration_seconds": 30.0,
+        "audio_files": {
+            "mic": {
+                "path": "/abs/x-mic.wav",
+                "status": "captured_normally",
+                "duration_seconds": 30.0,
+                "truncated_at_offset_seconds": None,
+            },
+            "system_audio": {
+                "path": "/abs/x-system.wav",
+                "status": "captured_normally",
+                "duration_seconds": 30.0,
+                "truncated_at_offset_seconds": None,
+            },
+        },
+        "sources": {
+            "mic": {"status": "attached"},
+            "system_audio": {"status": "attached"},
+            "video": {"status": "never_attached"},
+        },
+        "warnings": [],
+        "final": True,
+    }
+    if combined_audio is not None:
+        final["combined_audio"] = combined_audio
+    return final
+
+
+def test_print_stop_summary_combined_produced_line_shape(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`combined: <path>   <duration>   produced` is emitted on success."""
+    cli._print_stop_summary(
+        _base_final(
+            {
+                "path": "/abs/x.wav",
+                "status": "produced",
+                "duration_seconds": 30.0,
+            }
+        )
+    )
+    out = capsys.readouterr().out
+    assert "  combined: /abs/x.wav   30.0 s   produced" in out
+
+
+def test_print_stop_summary_combined_failed_line_shape(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`combined: <path>   not produced — <reason>` is emitted on failure."""
+    cli._print_stop_summary(
+        _base_final(
+            {
+                "path": "/abs/x.wav",
+                "status": "failed",
+                "reason": "disk full",
+            }
+        )
+    )
+    out = capsys.readouterr().out
+    assert "  combined: /abs/x.wav   not produced — disk full" in out
+
+
+def test_print_stop_summary_combined_key_absent_emits_no_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Legacy state files (no `combined_audio` key) render no extra line."""
+    cli._print_stop_summary(_base_final(None))
+    out = capsys.readouterr().out
+    assert "combined:" not in out
 
 
 def test_stop_exits_2_on_permission_denied_in_state_file(

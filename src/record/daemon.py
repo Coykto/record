@@ -27,6 +27,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import combine as combine_module
 from . import config as config_module
 from . import control, feedback, ipc, launchagent, paths, secrets, state
 from . import transcribe as transcribe_module
@@ -384,7 +385,6 @@ class Daemon:
                 return
             self._state = _CaptureState.STOPPING
 
-        finalized_audio_paths: list[str] = []
         try:
             final = await session.stop()
         except Exception as exc:  # pragma: no cover - defensive
@@ -392,13 +392,9 @@ class Daemon:
             final = None
         else:
             if isinstance(final, dict):
-                files = final.get("audio_files") or {}
-                if isinstance(files, dict):
-                    for entry in files.values():
-                        if isinstance(entry, dict):
-                            p = entry.get("path")
-                            if isinstance(p, str):
-                                finalized_audio_paths.append(p)
+                # Spec 007 slice 2: combine BEFORE clearing the session — the
+                # helper writes to capture-state.json via the session handle.
+                await self._run_combine(session, final)
 
         async with self._lock:
             self._session = None
@@ -406,13 +402,10 @@ class Daemon:
             self._started_at = None
             self._capture_id = None
 
-        # Spec 004 slice 2: a system-event-driven stop is just as eligible for
-        # auto-transcription as an explicit ``record stop``. Spawn after the
-        # capture has been confirmed finalized and the state has unwound to
-        # IDLE (a transcription failure must never trap the state machine).
-        # Spec 005: two WAVs per session — kick off one transcription per file.
-        for audio_str in finalized_audio_paths:
-            self._spawn_transcription(Path(audio_str))
+        # Spec 007 slice 3: transcription is driven from the combined file
+        # only. Source WAVs are never sent to the cloud.
+        if isinstance(final, dict):
+            self._spawn_transcription_for_combined(final)
 
     # ----- Hotkey routing (slice 5) ---------------------------------------
 
@@ -637,6 +630,203 @@ class Daemon:
                 message="hotkey registration timed out",
             )
 
+    # ----- Combine step (spec 007 slice 2) --------------------------------
+
+    _COMBINE_TIMEOUT_SECONDS = 300.0
+
+    async def _run_combine(
+        self,
+        session: CaptureSession,
+        final: dict[str, object],
+    ) -> None:
+        """Run the stop-time combine step and persist its outcome.
+
+        Mutates ``final`` (the live session-state dict returned by
+        :meth:`CaptureSession.stop`) and re-writes ``capture-state.json`` via
+        ``session.set_combined_audio`` so the CLI's stop summary can render
+        the new line. Never raises — every failure mode is recorded as a
+        ``combined_audio.status == "failed"`` entry.
+
+        Source-format validation in :func:`combine.combine_wavs` is cheap
+        because the Swift backend's WAV format is fixed (int16/mono/16 kHz,
+        set in swift-capture/Sources/RecordCapture/WAVWriter.swift:40-65).
+        """
+        basename_str = final.get("basename")
+        if not isinstance(basename_str, str):
+            # Defensive — every real session sets basename. If it's missing we
+            # can't even name the combined file; skip without persisting.
+            self._log.error(
+                "combine_failed",
+                reason="session basename missing",
+                error_type="CombineError",
+            )
+            return
+        basename = Path(basename_str)
+        combined_path = basename.parent / f"{basename.name}.wav"
+
+        files = final.get("audio_files") or {}
+        mic_entry = files.get("mic") if isinstance(files, dict) else None
+        sys_entry = (
+            files.get("system_audio") if isinstance(files, dict) else None
+        )
+        mic_path_str = (
+            mic_entry.get("path") if isinstance(mic_entry, dict) else None
+        )
+        sys_path_str = (
+            sys_entry.get("path") if isinstance(sys_entry, dict) else None
+        )
+
+        def _persist(combined_audio: dict[str, object]) -> None:
+            final["combined_audio"] = combined_audio
+            try:
+                session.set_combined_audio(combined_audio)
+            except Exception as exc:  # pragma: no cover - defensive
+                self._log.warning(
+                    "combine_state_persist_failed", error=str(exc)
+                )
+
+        # Pre-call check: per the spec a missing source file means we never
+        # invoke combine_wavs. Use the actual on-disk presence as the truth
+        # rather than the wire-level ``status`` field, since "produced" can be
+        # legitimate even when the file was later moved/deleted.
+        mic_path = Path(mic_path_str) if isinstance(mic_path_str, str) else None
+        sys_path = Path(sys_path_str) if isinstance(sys_path_str, str) else None
+        if (
+            mic_path is None
+            or sys_path is None
+            or not mic_path.is_file()
+            or not sys_path.is_file()
+        ):
+            reason = "one or more source files unavailable"
+            _persist(
+                {
+                    "path": str(combined_path),
+                    "status": "failed",
+                    "reason": reason,
+                }
+            )
+            self._log.error(
+                "combine_failed",
+                mic_path=str(mic_path) if mic_path is not None else None,
+                system_path=str(sys_path) if sys_path is not None else None,
+                combined_path=str(combined_path),
+                reason=reason,
+                error_type="CombineError",
+            )
+            return
+
+        self._log.info(
+            "combine_started",
+            mic_path=str(mic_path),
+            system_path=str(sys_path),
+            combined_path=str(combined_path),
+        )
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    combine_module.combine_wavs,
+                    mic_path,
+                    sys_path,
+                    combined_path,
+                ),
+                timeout=self._COMBINE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            reason = "combine timed out"
+            _persist(
+                {
+                    "path": str(combined_path),
+                    "status": "failed",
+                    "reason": reason,
+                }
+            )
+            self._log.error(
+                "combine_failed",
+                mic_path=str(mic_path),
+                system_path=str(sys_path),
+                combined_path=str(combined_path),
+                reason=reason,
+                error_type="CombineError",
+            )
+            return
+        except FileNotFoundError:
+            reason = "one or more source files unavailable"
+            _persist(
+                {
+                    "path": str(combined_path),
+                    "status": "failed",
+                    "reason": reason,
+                }
+            )
+            self._log.error(
+                "combine_failed",
+                mic_path=str(mic_path),
+                system_path=str(sys_path),
+                combined_path=str(combined_path),
+                reason=reason,
+                error_type="CombineError",
+            )
+            return
+        except combine_module.CombineError as exc:
+            _persist(
+                {
+                    "path": str(combined_path),
+                    "status": "failed",
+                    "reason": str(exc),
+                }
+            )
+            self._log.error(
+                "combine_failed",
+                mic_path=str(mic_path),
+                system_path=str(sys_path),
+                combined_path=str(combined_path),
+                reason=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return
+
+        _persist(
+            {
+                "path": str(combined_path),
+                "status": "produced",
+                "duration_seconds": result.duration_seconds,
+            }
+        )
+        self._log.info(
+            "combine_complete",
+            combined_path=str(combined_path),
+            duration_seconds=result.duration_seconds,
+        )
+
+    def _spawn_transcription_for_combined(self, final: dict[str, object]) -> None:
+        """Spec 007 slice 3: transcription is driven from the combined file only.
+
+        Reads ``combined_audio`` from ``final`` (populated by :meth:`_run_combine`):
+        on ``status == "produced"`` spawns exactly one transcription job against the
+        combined path; on any other status logs ``transcription_skipped`` at WARNING
+        with ``reason="combine_failed"`` and does nothing. Per-source WAVs are never
+        sent to the cloud (functional spec §2.9).
+        """
+        combined = final.get("combined_audio")
+        combined_path_str: str | None = None
+        status: object = None
+        if isinstance(combined, dict):
+            raw_path = combined.get("path")
+            if isinstance(raw_path, str):
+                combined_path_str = raw_path
+            status = combined.get("status")
+
+        if status == "produced" and combined_path_str is not None:
+            self._spawn_transcription(Path(combined_path_str))
+            return
+
+        self._log.warning(
+            "transcription_skipped",
+            audio_path=combined_path_str,
+            reason="combine_failed",
+        )
+
     async def _handle_stop(self) -> control.ControlResponse:
         async with self._lock:
             if self._state == _CaptureState.IDLE:
@@ -670,6 +860,11 @@ class Daemon:
                 detail=f"capture failed to stop: {type(exc).__name__}: {exc}",
             )
 
+        # Spec 007 slice 2: combine the two source WAVs into one mono mix
+        # before releasing the session and replying on the control socket.
+        # ``_run_combine`` mutates ``final`` and persists capture-state.json.
+        await self._run_combine(session, final)
+
         async with self._lock:
             self._session = None
             self._state = _CaptureState.IDLE
@@ -680,11 +875,10 @@ class Daemon:
         # RUNNING→IDLE regardless of input channel.
         self._safe_play_stop()
 
-        # Spec 004 slice 2 + spec 005: kick off auto-transcription per file.
-        # Fire-and-forget — the control reply must not wait on Deepgram.
-        # ``_spawn_transcription`` is safe to call without a configured key
-        # (it logs and returns). With independent mic / system files we now
-        # spawn one transcription per produced WAV.
+        # Spec 007 slice 3: build the per-source path map for the control
+        # reply (audio_path / audio_paths still describe the source files for
+        # backwards compatibility), but drive transcription exclusively from
+        # the combined file. Source WAVs are never sent to the cloud.
         audio_paths_map: dict[str, str] = {}
         files = final.get("audio_files") or {}
         if isinstance(files, dict):
@@ -693,7 +887,8 @@ class Daemon:
                     p = entry.get("path")
                     if isinstance(p, str):
                         audio_paths_map[source_name] = p
-                        self._spawn_transcription(Path(p))
+
+        self._spawn_transcription_for_combined(final)
 
         # Confirm the final state was persisted (CaptureSession set final=True
         # before returning). The CLI re-reads `capture-state.json` to print

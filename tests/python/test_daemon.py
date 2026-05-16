@@ -305,7 +305,18 @@ class _FakeSession:
         self.stop_calls += 1
         self.stopped_event.set()
         self._state["final"] = True
-        return dict(self._state)
+        # Match the real CaptureSession's contract: return the live state dict
+        # (not a copy). The daemon's combine step folds ``combined_audio`` into
+        # this dict via ``set_combined_audio`` and the CLI summary reads it.
+        return self._state
+
+    def set_combined_audio(self, combined_audio: dict[str, object]) -> None:
+        """Match :meth:`CaptureSession.set_combined_audio` for spec 007 slice 2."""
+        self.combined_audio = combined_audio
+        self._state["combined_audio"] = combined_audio
+        # Mirror the real session's persistence so tests that read the
+        # on-disk capture-state.json see the update.
+        state.write_state(self._state)
 
 
 def _make_daemon(
@@ -1165,13 +1176,31 @@ async def _drain_background(d: daemon.Daemon, timeout: float = 2.0) -> None:
 def test_stop_spawns_one_transcription_task_and_writes_files(
     daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A successful stop → one transcription task per finalized WAV.
+    """A successful stop → one transcription task against the combined file.
 
-    Spec 005: capture produces two WAVs (mic + system_audio) so the daemon
-    spawns two backend instances and writes a transcript triple next to each.
+    Spec 007 slice 3: transcription is driven exclusively from the combined
+    file; per-source WAVs are never sent to the cloud.
     """
     handed_out = _patch_transcription(monkeypatch)
-    d, sessions = _make_daemon(daemon_paths)
+    state_path = daemon_paths["root"] / "capture-state.json"
+    monkeypatch.setattr(state, "_default_state_file", lambda: state_path)
+
+    session_holder: list[_CombineFakeSession] = []
+
+    def _factory(
+        basename: Path, video_output_path: Path | None
+    ) -> _CombineFakeSession:
+        s = _CombineFakeSession(
+            basename=basename, video_output_path=video_output_path
+        )
+        session_holder.append(s)
+        return s
+
+    d = daemon.Daemon(
+        daemon_log_path=daemon_paths["log"],
+        session_factory=_factory,
+        output_folder=daemon_paths["root"],
+    )
 
     async def _drive() -> control.ControlResponse:
         await d.handle_request(control.StartRequest())
@@ -1181,27 +1210,32 @@ def test_stop_spawns_one_transcription_task_and_writes_files(
 
     resp = asyncio.run(_drive())
     assert resp.status == "ok"
-    # One backend per source: mic + system_audio.
-    assert len(handed_out) == 2
-    for stub in handed_out:
-        assert len(stub.calls) == 1
+    # Exactly one backend: the combined file only.
+    assert len(handed_out) == 1
+    assert len(handed_out[0].calls) == 1
 
-    # Confirm both WAV paths were transcribed and that the three transcript
-    # files appear next to each one.
-    basename = sessions[0].basename
+    basename = session_holder[0].basename
     mic_path = Path(str(basename) + "-mic.wav")
     system_path = Path(str(basename) + "-system.wav")
-    called_paths = {stub.calls[0] for stub in handed_out}
-    assert called_paths == {mic_path, system_path}
-    for audio_path in (mic_path, system_path):
-        stem_dir = audio_path.parent
-        base = audio_path.stem
-        assert (stem_dir / f"{base}.json").is_file()
-        assert (stem_dir / f"{base}.txt").is_file()
-        assert (stem_dir / f"{base}.srt").is_file()
+    combined_path = Path(str(basename) + ".wav")
+    assert handed_out[0].calls[0] == combined_path
 
-    # ControlResponse round-trip: ``audio_paths`` carries both, ``audio_path``
-    # keeps the mic file as the single-field surface.
+    # Combined-file transcript triple appears.
+    base = combined_path.stem
+    stem_dir = combined_path.parent
+    assert (stem_dir / f"{base}.json").is_file()
+    assert (stem_dir / f"{base}.txt").is_file()
+    assert (stem_dir / f"{base}.srt").is_file()
+    # Per-source transcripts must NOT appear.
+    for source_path in (mic_path, system_path):
+        s_base = source_path.stem
+        assert not (stem_dir / f"{s_base}.json").exists()
+        assert not (stem_dir / f"{s_base}.txt").exists()
+        assert not (stem_dir / f"{s_base}.srt").exists()
+
+    # ControlResponse round-trip: ``audio_paths`` still carries both source
+    # files, ``audio_path`` still keeps the mic file as the single-field
+    # surface (slice 3 does not change this contract).
     assert resp.audio_paths == {
         "mic": str(mic_path),
         "system_audio": str(system_path),
@@ -1216,10 +1250,29 @@ def test_no_api_key_skips_transcription_and_logs_warning(
 ) -> None:
     """No key → no task, no exception, ``transcription_skipped`` at WARNING.
 
-    Capture still finalizes cleanly and the daemon stays IDLE.
+    Spec 007 slice 3: with combine succeeding, there is exactly one skipped
+    transcription (against the combined file), not two.
     """
     handed_out = _patch_transcription(monkeypatch, api_key=None)
-    d, sessions = _make_daemon(daemon_paths)
+    state_path = daemon_paths["root"] / "capture-state.json"
+    monkeypatch.setattr(state, "_default_state_file", lambda: state_path)
+
+    session_holder: list[_CombineFakeSession] = []
+
+    def _factory(
+        basename: Path, video_output_path: Path | None
+    ) -> _CombineFakeSession:
+        s = _CombineFakeSession(
+            basename=basename, video_output_path=video_output_path
+        )
+        session_holder.append(s)
+        return s
+
+    d = daemon.Daemon(
+        daemon_log_path=daemon_paths["log"],
+        session_factory=_factory,
+        output_folder=daemon_paths["root"],
+    )
 
     caplog.set_level(logging.WARNING, logger="record.daemon")
 
@@ -1238,20 +1291,24 @@ def test_no_api_key_skips_transcription_and_logs_warning(
     )
     # Daemon returned to IDLE and the file finalized.
     assert d._state == daemon._CaptureState.IDLE
-    # The warning was logged with the structured fields we promised.
+    # ``_spawn_transcription`` itself logs ``transcription_skipped`` with
+    # ``reason="no_api_key"`` — that code path predates slice 3.
     matching = [
-        rec for rec in caplog.records if "transcription_skipped" in rec.getMessage()
+        rec for rec in caplog.records
+        if "transcription_skipped" in rec.getMessage()
+        and "no_api_key" in rec.getMessage()
     ]
-    assert matching, (
-        f"expected `transcription_skipped` WARNING; saw: "
-        f"{[r.getMessage() for r in caplog.records]!r}"
+    assert len(matching) == 1, (
+        f"expected exactly one `transcription_skipped` reason=no_api_key WARNING; "
+        f"saw: {[r.getMessage() for r in caplog.records]!r}"
     )
-    # The audio path(s) the user "lost" are in the structured payloads
-    # (one warning per finalized WAV). Spec 005: mic path is sufficient.
-    basename = sessions[0].basename
-    mic_path = str(basename) + "-mic.wav"
-    payloads = " ".join(rec.getMessage() for rec in matching)
-    assert mic_path in payloads
+    # The audio path is the combined file (no -mic/-system suffix).
+    basename = session_holder[0].basename
+    combined_path = str(basename) + ".wav"
+    payload = matching[0].getMessage()
+    assert combined_path in payload
+    assert "-mic.wav" not in payload
+    assert "-system.wav" not in payload
 
 
 def test_transcription_failure_logged_no_exception_escapes(
@@ -1264,7 +1321,25 @@ def test_transcription_failure_logged_no_exception_escapes(
         raise_exc=transcribe_module.TranscriptionError("deepgram 401: bad key")
     )
     _patch_transcription(monkeypatch, backends=[failing])
-    d, _sessions = _make_daemon(daemon_paths)
+    state_path = daemon_paths["root"] / "capture-state.json"
+    monkeypatch.setattr(state, "_default_state_file", lambda: state_path)
+
+    session_holder: list[_CombineFakeSession] = []
+
+    def _factory(
+        basename: Path, video_output_path: Path | None
+    ) -> _CombineFakeSession:
+        s = _CombineFakeSession(
+            basename=basename, video_output_path=video_output_path
+        )
+        session_holder.append(s)
+        return s
+
+    d = daemon.Daemon(
+        daemon_log_path=daemon_paths["log"],
+        session_factory=_factory,
+        output_folder=daemon_paths["root"],
+    )
 
     caplog.set_level(logging.ERROR, logger="record.daemon")
 
@@ -1300,23 +1375,33 @@ def test_two_stops_in_quick_succession_produce_independent_tasks(
 ) -> None:
     """Two start/stop cycles → independent transcription tasks per cycle.
 
-    Spec 005: each cycle finalizes two WAVs (mic + system_audio) so two
-    backends are spawned per cycle (four total). Each backend gates completion
-    behind its own ``asyncio.Event`` so the test can assert ``_handle_stop``
-    returned before the prior cycle's backends finished.
+    Spec 007 slice 3: each cycle spawns exactly one transcription (against
+    the combined file), so two cycles produce two in-flight tasks.
     """
-    gate_a1 = asyncio.Event()
-    gate_a2 = asyncio.Event()
-    gate_b1 = asyncio.Event()
-    gate_b2 = asyncio.Event()
-    stub_a1 = _StubBackend(done=gate_a1)
-    stub_a2 = _StubBackend(done=gate_a2)
-    stub_b1 = _StubBackend(done=gate_b1)
-    stub_b2 = _StubBackend(done=gate_b2)
-    _patch_transcription(
-        monkeypatch, backends=[stub_a1, stub_a2, stub_b1, stub_b2]
+    gate_a = asyncio.Event()
+    gate_b = asyncio.Event()
+    stub_a = _StubBackend(done=gate_a)
+    stub_b = _StubBackend(done=gate_b)
+    _patch_transcription(monkeypatch, backends=[stub_a, stub_b])
+    state_path = daemon_paths["root"] / "capture-state.json"
+    monkeypatch.setattr(state, "_default_state_file", lambda: state_path)
+
+    session_holder: list[_CombineFakeSession] = []
+
+    def _factory(
+        basename: Path, video_output_path: Path | None
+    ) -> _CombineFakeSession:
+        s = _CombineFakeSession(
+            basename=basename, video_output_path=video_output_path
+        )
+        session_holder.append(s)
+        return s
+
+    d = daemon.Daemon(
+        daemon_log_path=daemon_paths["log"],
+        session_factory=_factory,
+        output_folder=daemon_paths["root"],
     )
-    d, sessions = _make_daemon(daemon_paths)
 
     async def _drive() -> None:
         # Cycle 1.
@@ -1324,39 +1409,37 @@ def test_two_stops_in_quick_succession_produce_independent_tasks(
         stop_a = await d.handle_request(control.StopRequest())
         assert stop_a.status == "ok"
 
-        # Let the scheduler enter the transcription tasks at least once so
-        # the stubs' ``.calls`` reflect "I was invoked but I'm parked".
+        # Let the scheduler enter the transcription task at least once so
+        # the stub's ``.calls`` reflects "I was invoked but I'm parked".
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        # Cycle 1's tasks are parked on their gates; cycle 2 must not block.
-        assert stub_a1.calls and not gate_a1.is_set()
-        assert stub_a2.calls and not gate_a2.is_set()
+        # Cycle 1's task is parked on its gate; cycle 2 must not block.
+        assert stub_a.calls and not gate_a.is_set()
 
-        # Cycle 2. If the first cycle's tasks blocked the daemon, this stop
+        # Cycle 2. If the first cycle's task blocked the daemon, this stop
         # would never return.
         await d.handle_request(control.StartRequest())
         stop_b = await d.handle_request(control.StopRequest())
         assert stop_b.status == "ok"
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        assert stub_b1.calls
-        assert stub_b2.calls
+        assert stub_b.calls
 
-        # Four transcription tasks in flight (two per cycle).
+        # Two transcription tasks in flight (one per cycle).
         transcribe_tasks = [
             t
             for t in d._background
             if (t.get_name() or "").startswith("transcribe:")
         ]
-        assert len(transcribe_tasks) == 4
+        assert len(transcribe_tasks) == 2
 
         # Release every gate and drain.
-        for g in (gate_a1, gate_a2, gate_b1, gate_b2):
+        for g in (gate_a, gate_b):
             g.set()
         await _drain_background(d)
 
     asyncio.run(_drive())
-    assert len(sessions) == 2
+    assert len(session_holder) == 2
 
 
 def test_quit_does_not_await_in_flight_transcription(
@@ -1368,24 +1451,40 @@ def test_quit_does_not_await_in_flight_transcription(
     transcription task is abandoned (logged) rather than awaited.
     """
     gate = asyncio.Event()
-    # Spec 005: two finalized WAVs → two backends/tasks per cycle. Both share
-    # the same gate so the test only needs one ``set()`` to release them.
-    slow_mic = _StubBackend(done=gate)
-    slow_sys = _StubBackend(done=gate)
-    _patch_transcription(monkeypatch, backends=[slow_mic, slow_sys])
-    d, _sessions = _make_daemon(daemon_paths)
+    # Spec 007 slice 3: one finalized combined WAV → one backend/task per
+    # cycle.
+    slow = _StubBackend(done=gate)
+    _patch_transcription(monkeypatch, backends=[slow])
+    state_path = daemon_paths["root"] / "capture-state.json"
+    monkeypatch.setattr(state, "_default_state_file", lambda: state_path)
+
+    session_holder: list[_CombineFakeSession] = []
+
+    def _factory(
+        basename: Path, video_output_path: Path | None
+    ) -> _CombineFakeSession:
+        s = _CombineFakeSession(
+            basename=basename, video_output_path=video_output_path
+        )
+        session_holder.append(s)
+        return s
+
+    d = daemon.Daemon(
+        daemon_log_path=daemon_paths["log"],
+        session_factory=_factory,
+        output_folder=daemon_paths["root"],
+    )
 
     async def _drive() -> None:
         await d.handle_request(control.StartRequest())
         await d.handle_request(control.StopRequest())
-        # Yield so the spawned tasks enter ``backend.transcribe`` and park
+        # Yield so the spawned task enters ``backend.transcribe`` and parks
         # on the gate before we issue the quit.
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        assert slow_mic.calls, "mic transcription task did not start"
-        assert slow_sys.calls, "system transcription task did not start"
+        assert slow.calls, "transcription task did not start"
 
-        # quit must NOT block on the in-flight transcriptions.
+        # quit must NOT block on the in-flight transcription.
         resp = await asyncio.wait_for(
             d.handle_request(control.QuitRequest(finalize=False)),
             timeout=2.0,
@@ -1394,7 +1493,7 @@ def test_quit_does_not_await_in_flight_transcription(
         assert resp.status == "ok"
         assert d._shutdown_event.is_set()
 
-        # The transcription tasks are still in the background set — they were
+        # The transcription task is still in the background set — it was
         # NOT awaited by quit. (serve_forever's cleanup partition logs +
         # abandons rather than awaits; we don't run serve_forever here.)
         transcribe_tasks = [
@@ -1402,11 +1501,11 @@ def test_quit_does_not_await_in_flight_transcription(
             for t in d._background
             if (t.get_name() or "").startswith("transcribe:")
         ]
-        assert len(transcribe_tasks) == 2
+        assert len(transcribe_tasks) == 1
         for t in transcribe_tasks:
             assert not t.done()
 
-        # Tidy: release the gate so the orphaned tasks can finalize before
+        # Tidy: release the gate so the orphaned task can finalize before
         # the event loop closes (avoids a noisy warning).
         gate.set()
         for t in transcribe_tasks:
@@ -1473,3 +1572,412 @@ def test_serve_forever_cleanup_logs_abandoned_transcription(
     ]
     assert len(abandoned) == 1
     assert abandoned[0][1].get("audio_stem") == "2026-05-15T10-00-00"
+
+
+# ---------------------------------------------------------------------------
+# Spec 007 slice 2: combine step is invoked on both stop paths
+# ---------------------------------------------------------------------------
+
+
+import array  # noqa: E402
+import wave  # noqa: E402
+
+from record import combine as combine_module  # noqa: E402
+
+
+def _write_int16_wav(
+    path: Path,
+    samples: list[int],
+    *,
+    framerate: int = 16_000,
+) -> None:
+    """Write a tiny mono int16 16 kHz WAV used as a combine-step input."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(framerate)
+        wf.writeframes(array.array("h", samples).tobytes())
+
+
+class _CombineFakeSession(_FakeSession):
+    """Variant that drops real WAVs in place when ``start()`` runs.
+
+    Lets the real :func:`combine.combine_wavs` run end-to-end against the
+    state-machine handlers without spawning a Swift child.
+    """
+
+    def __init__(
+        self,
+        *,
+        basename: Path,
+        video_output_path: Path | None = None,
+        write_mic: bool = True,
+        write_system: bool = True,
+    ) -> None:
+        super().__init__(basename=basename, video_output_path=video_output_path)
+        self._write_mic = write_mic
+        self._write_system = write_system
+
+    async def start(self) -> None:
+        await super().start()
+        if self._write_mic:
+            _write_int16_wav(
+                Path(str(self.basename) + "-mic.wav"),
+                [100, 200, 300, 400, 500],
+            )
+        if self._write_system:
+            _write_int16_wav(
+                Path(str(self.basename) + "-system.wav"),
+                [10, 20, 30, 40, 50],
+            )
+
+
+def test_handle_stop_combine_happy_path_persists_produced_state(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_handle_stop` runs combine; produced status lands in state + final."""
+    _patch_transcription(monkeypatch)
+    # Point the daemon's state-file path at tmp so we can re-read it.
+    state_path = daemon_paths["root"] / "capture-state.json"
+    monkeypatch.setattr(state, "_default_state_file", lambda: state_path)
+
+    session_holder: list[_CombineFakeSession] = []
+
+    def _factory(
+        basename: Path, video_output_path: Path | None
+    ) -> _CombineFakeSession:
+        s = _CombineFakeSession(
+            basename=basename, video_output_path=video_output_path
+        )
+        session_holder.append(s)
+        return s
+
+    d = daemon.Daemon(
+        daemon_log_path=daemon_paths["log"],
+        session_factory=_factory,
+        output_folder=daemon_paths["root"],
+    )
+
+    async def _drive() -> control.ControlResponse:
+        await d.handle_request(control.StartRequest())
+        resp = await d.handle_request(control.StopRequest())
+        await _drain_background(d)
+        return resp
+
+    resp = asyncio.run(_drive())
+    assert resp.status == "ok"
+
+    s = session_holder[0]
+    combined = s.state.get("combined_audio")
+    assert isinstance(combined, dict)
+    assert combined.get("status") == "produced"
+    expected_path = Path(str(s.basename) + ".wav")
+    assert combined.get("path") == str(expected_path)
+    assert combined.get("duration_seconds") is not None
+    # The combined file itself was written.
+    assert expected_path.is_file()
+    # On-disk capture-state.json reflects the combined entry.
+    on_disk = json.loads(state_path.read_text(encoding="utf-8"))
+    assert on_disk.get("combined_audio", {}).get("status") == "produced"
+
+
+def test_handle_stop_combine_failure_persists_failed_state_and_logs(
+    daemon_paths: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Combine raising `CombineError("disk full")` records `failed` + logs."""
+    _patch_transcription(monkeypatch)
+    state_path = daemon_paths["root"] / "capture-state.json"
+    monkeypatch.setattr(state, "_default_state_file", lambda: state_path)
+
+    # Force combine_wavs to raise after pre-call file checks pass.
+    def _boom(mic: Path, sys: Path, out: Path):  # noqa: ANN202
+        raise combine_module.CombineError("disk full")
+
+    monkeypatch.setattr(combine_module, "combine_wavs", _boom)
+
+    session_holder: list[_CombineFakeSession] = []
+
+    def _factory(
+        basename: Path, video_output_path: Path | None
+    ) -> _CombineFakeSession:
+        s = _CombineFakeSession(
+            basename=basename, video_output_path=video_output_path
+        )
+        session_holder.append(s)
+        return s
+
+    d = daemon.Daemon(
+        daemon_log_path=daemon_paths["log"],
+        session_factory=_factory,
+        output_folder=daemon_paths["root"],
+    )
+
+    caplog.set_level(logging.ERROR, logger="record.daemon")
+
+    async def _drive() -> control.ControlResponse:
+        await d.handle_request(control.StartRequest())
+        resp = await d.handle_request(control.StopRequest())
+        await _drain_background(d)
+        return resp
+
+    resp = asyncio.run(_drive())
+    assert resp.status == "ok"
+
+    s = session_holder[0]
+    combined = s.state.get("combined_audio")
+    assert isinstance(combined, dict)
+    assert combined.get("status") == "failed"
+    assert combined.get("reason") == "disk full"
+
+    # ERROR log line names the failure type.
+    matching = [
+        rec for rec in caplog.records if "combine_failed" in rec.getMessage()
+    ]
+    assert matching, (
+        f"expected `combine_failed` ERROR; saw: "
+        f"{[r.getMessage() for r in caplog.records]!r}"
+    )
+    msg = matching[-1].getMessage()
+    assert "CombineError" in msg
+    assert "disk full" in msg
+
+    # Source WAVs survived the failure.
+    assert Path(str(s.basename) + "-mic.wav").is_file()
+    assert Path(str(s.basename) + "-system.wav").is_file()
+
+
+def test_handle_stop_combine_missing_source_does_not_call_combine_wavs(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-call check skips combine entirely when a source file is absent."""
+    _patch_transcription(monkeypatch)
+    state_path = daemon_paths["root"] / "capture-state.json"
+    monkeypatch.setattr(state, "_default_state_file", lambda: state_path)
+
+    # Spy on combine_wavs and assert it is never called.
+    calls: list[tuple[Path, Path, Path]] = []
+
+    def _spy(mic: Path, sys: Path, out: Path):  # noqa: ANN202
+        calls.append((mic, sys, out))
+        raise AssertionError("combine_wavs must not be invoked")
+
+    monkeypatch.setattr(combine_module, "combine_wavs", _spy)
+
+    session_holder: list[_CombineFakeSession] = []
+
+    def _factory(
+        basename: Path, video_output_path: Path | None
+    ) -> _CombineFakeSession:
+        # Drop only the system-audio file; leave mic absent on disk.
+        s = _CombineFakeSession(
+            basename=basename,
+            video_output_path=video_output_path,
+            write_mic=False,
+            write_system=True,
+        )
+        session_holder.append(s)
+        return s
+
+    d = daemon.Daemon(
+        daemon_log_path=daemon_paths["log"],
+        session_factory=_factory,
+        output_folder=daemon_paths["root"],
+    )
+
+    async def _drive() -> control.ControlResponse:
+        await d.handle_request(control.StartRequest())
+        resp = await d.handle_request(control.StopRequest())
+        await _drain_background(d)
+        return resp
+
+    resp = asyncio.run(_drive())
+    assert resp.status == "ok"
+    assert calls == []
+
+    s = session_holder[0]
+    combined = s.state.get("combined_audio")
+    assert isinstance(combined, dict)
+    assert combined.get("status") == "failed"
+    assert combined.get("reason") == "one or more source files unavailable"
+
+
+def test_watch_for_system_event_stop_runs_combine(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The auto-stop path also runs `_run_combine` and persists `produced`."""
+    _patch_transcription(monkeypatch)
+    state_path = daemon_paths["root"] / "capture-state.json"
+    monkeypatch.setattr(state, "_default_state_file", lambda: state_path)
+
+    session_holder: list[_CombineFakeSession] = []
+
+    def _factory(
+        basename: Path, video_output_path: Path | None
+    ) -> _CombineFakeSession:
+        s = _CombineFakeSession(
+            basename=basename, video_output_path=video_output_path
+        )
+        session_holder.append(s)
+        return s
+
+    d = daemon.Daemon(
+        daemon_log_path=daemon_paths["log"],
+        session_factory=_factory,
+        output_folder=daemon_paths["root"],
+    )
+
+    async def _drive() -> None:
+        await d.handle_request(control.StartRequest())
+        # Simulate a system-event-triggered shutdown: fire stopped_event from
+        # outside, then await the watcher task the daemon registered.
+        session = session_holder[0]
+        session.stopped_event.set()
+        # Drain background tasks (the watcher + any transcription jobs).
+        await _drain_background(d, timeout=3.0)
+
+    asyncio.run(_drive())
+
+    s = session_holder[0]
+    combined = s.state.get("combined_audio")
+    assert isinstance(combined, dict), (
+        f"expected combined_audio dict; got: {combined!r}"
+    )
+    assert combined.get("status") == "produced"
+    assert Path(combined["path"]).is_file()
+    # Daemon returned to IDLE via the watcher path.
+    assert d._state == daemon._CaptureState.IDLE
+
+
+# ---------------------------------------------------------------------------
+# Spec 007 slice 3: combine failure gates transcription
+# ---------------------------------------------------------------------------
+
+
+def test_combine_failure_skips_transcription_with_combine_failed_reason(
+    daemon_paths: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`_handle_stop`: combine failure → no transcription, skipped reason logged."""
+    handed_out = _patch_transcription(monkeypatch)
+    state_path = daemon_paths["root"] / "capture-state.json"
+    monkeypatch.setattr(state, "_default_state_file", lambda: state_path)
+
+    def _boom(mic: Path, sys: Path, out: Path):  # noqa: ANN202
+        raise combine_module.CombineError("disk full")
+
+    monkeypatch.setattr(combine_module, "combine_wavs", _boom)
+
+    session_holder: list[_CombineFakeSession] = []
+
+    def _factory(
+        basename: Path, video_output_path: Path | None
+    ) -> _CombineFakeSession:
+        s = _CombineFakeSession(
+            basename=basename, video_output_path=video_output_path
+        )
+        session_holder.append(s)
+        return s
+
+    d = daemon.Daemon(
+        daemon_log_path=daemon_paths["log"],
+        session_factory=_factory,
+        output_folder=daemon_paths["root"],
+    )
+
+    caplog.set_level(logging.WARNING, logger="record.daemon")
+
+    async def _drive() -> control.ControlResponse:
+        await d.handle_request(control.StartRequest())
+        resp = await d.handle_request(control.StopRequest())
+        await _drain_background(d)
+        return resp
+
+    resp = asyncio.run(_drive())
+    assert resp.status == "ok"
+    # Zero backends were constructed — transcription was gated.
+    assert handed_out == []
+
+    basename = session_holder[0].basename
+    combined_path = str(basename) + ".wav"
+
+    matching = [
+        rec for rec in caplog.records
+        if "transcription_skipped" in rec.getMessage()
+        and "combine_failed" in rec.getMessage()
+    ]
+    assert matching, (
+        f"expected `transcription_skipped` reason=combine_failed WARNING; "
+        f"saw: {[r.getMessage() for r in caplog.records]!r}"
+    )
+    payload = matching[-1].getMessage()
+    assert combined_path in payload
+    assert "-mic.wav" not in payload
+    assert "-system.wav" not in payload
+
+
+def test_watch_for_system_event_stop_combine_failure_skips_transcription(
+    daemon_paths: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Auto-stop path: combine failure → no transcription, skipped reason logged."""
+    handed_out = _patch_transcription(monkeypatch)
+    state_path = daemon_paths["root"] / "capture-state.json"
+    monkeypatch.setattr(state, "_default_state_file", lambda: state_path)
+
+    def _boom(mic: Path, sys: Path, out: Path):  # noqa: ANN202
+        raise combine_module.CombineError("disk full")
+
+    monkeypatch.setattr(combine_module, "combine_wavs", _boom)
+
+    session_holder: list[_CombineFakeSession] = []
+
+    def _factory(
+        basename: Path, video_output_path: Path | None
+    ) -> _CombineFakeSession:
+        s = _CombineFakeSession(
+            basename=basename, video_output_path=video_output_path
+        )
+        session_holder.append(s)
+        return s
+
+    d = daemon.Daemon(
+        daemon_log_path=daemon_paths["log"],
+        session_factory=_factory,
+        output_folder=daemon_paths["root"],
+    )
+
+    caplog.set_level(logging.WARNING, logger="record.daemon")
+
+    async def _drive() -> None:
+        await d.handle_request(control.StartRequest())
+        session = session_holder[0]
+        session.stopped_event.set()
+        await _drain_background(d, timeout=3.0)
+
+    asyncio.run(_drive())
+
+    # No transcription backend constructed.
+    assert handed_out == []
+    assert d._state == daemon._CaptureState.IDLE
+
+    basename = session_holder[0].basename
+    combined_path = str(basename) + ".wav"
+
+    matching = [
+        rec for rec in caplog.records
+        if "transcription_skipped" in rec.getMessage()
+        and "combine_failed" in rec.getMessage()
+    ]
+    assert matching, (
+        f"expected `transcription_skipped` reason=combine_failed WARNING; "
+        f"saw: {[r.getMessage() for r in caplog.records]!r}"
+    )
+    payload = matching[-1].getMessage()
+    assert combined_path in payload
+    assert "-mic.wav" not in payload
+    assert "-system.wav" not in payload

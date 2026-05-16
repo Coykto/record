@@ -1523,6 +1523,18 @@ class CaptureSession:
 
         return self._state
 
+    def set_combined_audio(self, combined_audio: dict[str, Any]) -> None:
+        """Merge ``combined_audio`` into the session state and re-persist.
+
+        Spec 007 slice 2: the daemon runs the combine step after :meth:`stop`
+        and folds the outcome back into ``capture-state.json`` so the CLI's
+        stop summary can render it. ``stop`` returns ``self._state`` itself
+        (live reference) — mutating it via this helper also updates the dict
+        the daemon holds.
+        """
+        self._state["combined_audio"] = combined_audio
+        self._write_state(self._state)
+
     # ----- Internals ------------------------------------------------------
 
     def _write_state(self, snapshot: dict[str, Any]) -> None:

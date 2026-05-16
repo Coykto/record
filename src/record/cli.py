@@ -297,6 +297,21 @@ def _print_stop_summary(final: dict[str, Any]) -> None:
             entry.get("truncated_at_offset_seconds"),
         )
         typer.echo(f"  {source}: {path}   {entry_duration}   {status_human}")
+    # Spec 007 slice 2: one extra line for the combined file. Legacy state
+    # files (pre-feature) lack the key entirely — render nothing in that case.
+    combined = final.get("combined_audio")
+    if isinstance(combined, dict):
+        combined_path = combined.get("path") or "(unknown)"
+        if combined.get("status") == "produced":
+            combined_duration = _format_duration(combined.get("duration_seconds"))
+            typer.echo(
+                f"  combined: {combined_path}   {combined_duration}   produced"
+            )
+        elif combined.get("status") == "failed":
+            reason = combined.get("reason") or "unknown"
+            typer.echo(
+                f"  combined: {combined_path}   not produced — {reason}"
+            )
     typer.echo(f"  duration: {duration}")
     typer.echo(f"  sources:  {sources_line}")
     typer.echo(f"  {video_line}")
