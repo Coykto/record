@@ -172,6 +172,85 @@ final class AudioCapture: NSObject {
     /// would leak otherwise.
     private var engineConfigObserver: NSObjectProtocol?
 
+    /// Monotonically incremented on every `AVAudioEngineConfigurationChange`.
+    /// Each scheduled fallback captures the generation it was queued under;
+    /// if the counter has advanced by the time the fallback fires, a fresher
+    /// route change is in flight and the older chain abandons itself.
+    /// Mutated only from the main queue, so no lock is needed.
+    private var micRestartGeneration: Int = 0
+
+    /// True between the `AVAudioEngineConfigurationChange` notification and
+    /// the moment we successfully bring the engine back up. Read/written
+    /// only on main.
+    private var pendingMicRestart: Bool = false
+
+    /// CoreAudio system-object listener that fires when the *system default
+    /// input device* changes (AirPods becoming default, USB mic unplugged,
+    /// etc.). Used to know when to re-target the per-device stream-format
+    /// listener. Stored so we can remove it in `stop()` / `handleMicLost`.
+    private var defaultInputListenerBlock: AudioObjectPropertyListenerBlock?
+
+    /// CoreAudio system-object listener that fires when the *system default
+    /// output device* changes. Important even though we don't render output:
+    /// AirPods becoming the default output can cause the OS to silently
+    /// pause our mic input AU without firing any other notification we
+    /// observe. We use this as one of several triggers to re-evaluate
+    /// whether the input has stopped flowing.
+    private var defaultOutputListenerBlock: AudioObjectPropertyListenerBlock?
+
+    /// CoreAudio device listener that fires when the currently-default input
+    /// device's stream format changes. For Bluetooth headsets this is the
+    /// "SCO profile finished negotiating, mic is ready" signal — exactly
+    /// when `engine.start()` will succeed after a route change.
+    private var formatListenerBlock: AudioObjectPropertyListenerBlock?
+
+    /// CoreAudio device listener for
+    /// `kAudioDevicePropertyDeviceIsRunningSomewhere` on the current
+    /// default input device. The OS toggles this whenever the device's I/O
+    /// state changes — including when an output route change (AirPods
+    /// connecting) causes the system to silently stop I/O on the input.
+    /// This is the direct, event-based signal "the mic stopped".
+    private var runningSomewhereListenerBlock: AudioObjectPropertyListenerBlock?
+
+    /// AudioObjectID of the device currently being watched by the per-input
+    /// listeners (`formatListenerBlock`, `runningSomewhereListenerBlock`).
+    /// Tracked so we know which object to call
+    /// `AudioObjectRemovePropertyListenerBlock` against when the default
+    /// input changes (or capture stops).
+    private var watchedInputDeviceID: AudioObjectID = AudioObjectID(kAudioObjectUnknown)
+
+    /// Background queue the CoreAudio property listeners dispatch on.
+    private let coreAudioListenerQueue = DispatchQueue(
+        label: "record.audiocapture.coreaudio",
+        qos: .userInitiated
+    )
+
+    // --- Mic-flow watchdog ---
+    //
+    // The route-change recovery path above is purely event-driven. In
+    // practice, some macOS scenarios — most notably AirPods connecting as
+    // the new default *output* device only — cause AVAudioEngine to
+    // silently stop calling the mic tap closure without ever firing
+    // `AVAudioEngineConfigurationChange` and without any CoreAudio
+    // default-input change (because the default input genuinely didn't
+    // change). Without a watchdog the mic tap just stops, no event reaches
+    // the orchestrator, the WAV writer stops getting samples, and at stop
+    // time we mistakenly report `captured_normally` with full elapsed
+    // duration even though the file is truncated.
+    //
+    // The watchdog periodically checks whether mic buffers have arrived
+    // recently. If the gap exceeds `micFlowStallThresholdSeconds` we
+    // assume the engine has silently wedged and trigger a full restart
+    // (same recovery path used by `handleEngineConfigurationChange`).
+    private let micFlowLock = NSLock()
+    private var lastMicBufferAt: Date?
+    private var micWatchdogTimer: DispatchSourceTimer?
+    /// Restart the engine if no mic buffer has arrived in this long.
+    /// 2 s is well above the typical inter-buffer interval (~25 ms at
+    /// 1024-frame buffers) but short enough that the user hears the
+    /// recovery rather than losing minutes of audio to a silent wedge.
+    private let micFlowStallThresholdSeconds: Double = 2.0
+
     /// Drain interval. Every 10 ms gives ~160 mono samples at 16 kHz —
     /// plenty small to keep WAV latency negligible without burning CPU.
     private let drainIntervalMs: Int = 10
@@ -318,13 +397,16 @@ final class AudioCapture: NSObject {
             return elapsed
         }
 
-        // Drop the engine-config observer before tearing anything down: once
-        // we stop the engine ourselves, AVAudioEngine may post a final
-        // notification we don't want to misinterpret as a mid-capture loss.
+        // Drop the engine-config observer and the CoreAudio listeners
+        // before tearing anything down: once we stop the engine ourselves,
+        // AVAudioEngine may post a final notification — and CoreAudio may
+        // fire one final format-change — that we don't want to misinterpret
+        // as a mid-capture loss.
         if let token = engineConfigObserver {
             NotificationCenter.default.removeObserver(token)
             engineConfigObserver = nil
         }
+        uninstallCoreAudioListeners()
 
         // Tear down sources first so no new samples land in the queues while
         // we're draining.
@@ -495,6 +577,11 @@ final class AudioCapture: NSObject {
             self?.handleEngineConfigurationChange()
         }
 
+        // Register CoreAudio property listeners that drive route-change
+        // recovery off real device events rather than a polling timer. See
+        // `installCoreAudioListeners` for the full story.
+        installCoreAudioListeners()
+
         emit(.sourceAttached(source: .mic))
     }
 
@@ -514,57 +601,377 @@ final class AudioCapture: NSObject {
     /// through to `handleMicLost` so the orchestrator records a genuine
     /// loss.
     private func handleEngineConfigurationChange() {
-        // If the mic has already been declared lost (or `stop()` has run
-        // and removed this observer's siblings) there is nothing to rebuild.
+        FileHandle.standardError.write(
+            Data("DBG mic-route: AVAudioEngineConfigurationChange\n".utf8)
+        )
+        triggerMicRestart(reason: "AVAudioEngineConfigurationChange")
+    }
+
+    /// Shared restart helper invoked by every event source that wants the
+    /// mic engine torn down and brought back up — `AVAudioEngineConfigurationChange`,
+    /// CoreAudio default-input changes, default-output changes, and the
+    /// `DeviceIsRunningSomewhere == false` transition on the current input
+    /// device. Idempotent w.r.t. an in-flight restart (the generation
+    /// counter ensures the latest event wins).
+    private func triggerMicRestart(reason: String) {
         lossLock.lock()
         let alreadyLost = micLost
         lossLock.unlock()
-        if alreadyLost {
+        if alreadyLost { return }
+
+        // `stop()` clears the configuration observer before tearing down —
+        // treat that as the signal that recovery is no longer wanted.
+        if engineConfigObserver == nil { return }
+
+        // Re-entrance guard. `engine.stop()` below itself flips
+        // `IsRunningSomewhere` to false, which re-fires that listener and
+        // re-enters this method while we're still mid-restart. If a
+        // restart is already pending and the engine is already torn down,
+        // just re-arm listeners and retry — don't bump the generation or
+        // redo the teardown. A genuinely fresh external event will arrive
+        // *after* the engine is back up, so engine.isRunning will be true
+        // and this guard won't swallow it.
+        if pendingMicRestart && !engine.isRunning {
+            rearmListenersOnCurrentDefaultInput()
+            attemptMicRestartIfPending()
             return
         }
 
-        // Drop the now-invalid tap. Safe to remove even if the underlying
-        // engine state has changed under us.
+        micRestartGeneration += 1
+        pendingMicRestart = true
+
         if micTapInstalled {
             engine.inputNode.removeTap(onBus: 0)
             micTapInstalled = false
         }
-
-        let input = engine.inputNode
-        let newFormat = input.outputFormat(forBus: 0)
-
-        // A 0-channel or 0-Hz format means no input device is present (e.g.
-        // headset went away and nothing else replaced it). Declare lost so
-        // the orchestrator log reflects reality rather than spinning trying
-        // to tap a dead bus.
-        guard newFormat.channelCount > 0, newFormat.sampleRate > 0 else {
-            handleMicLost(reason: "no input device after configuration change")
-            return
+        if engine.isRunning {
+            engine.stop()
         }
-
-        // Force the converter to rebuild against the new input format on the
-        // next buffer. (Without this we'd rely on the equality check in
-        // `convert()` to notice the change — explicit is clearer.)
         micConverter = nil
         micConverterInputFormat = nil
 
-        // Reinstall with `nil` so the tap uses the bus's natural format —
-        // matches the original `startMic()` setup.
+        // The current default input device may have just changed, so
+        // re-point both per-input listeners (format + IsRunningSomewhere)
+        // at whatever the new default is. Then try to bring the engine
+        // back up immediately — it will succeed if the format has already
+        // settled; otherwise the format listener (or a later
+        // IsRunningSomewhere transition back to true) will retrigger us.
+        rearmListenersOnCurrentDefaultInput()
+        attemptMicRestartIfPending()
+    }
+
+    /// Try to bring the engine back up *if* a restart is pending and the
+    /// current input bus reports a valid format. Called from the
+    /// configuration-change handler (immediate attempt) and from the
+    /// CoreAudio stream-format listener (the actual "device is ready"
+    /// signal). Idempotent: a no-op when nothing is pending or the engine
+    /// is already running.
+    ///
+    /// Must run on the main queue — mutates main-only state
+    /// (`pendingMicRestart`, `micTapInstalled`, the engine itself).
+    private func attemptMicRestartIfPending() {
+        if !pendingMicRestart { return }
+
+        lossLock.lock()
+        let alreadyLost = micLost
+        lossLock.unlock()
+        if alreadyLost { return }
+
+        // `stop()` removes the configuration observer before tearing things
+        // down — treat that as the signal to stop attempting recovery.
+        if engineConfigObserver == nil {
+            pendingMicRestart = false
+            return
+        }
+
+        let input = engine.inputNode
+        let newFormat = input.outputFormat(forBus: 0)
+        guard newFormat.channelCount > 0, newFormat.sampleRate > 0 else {
+            // Format isn't settled yet — wait for the next listener fire.
+            return
+        }
+
+        if micTapInstalled {
+            engine.inputNode.removeTap(onBus: 0)
+            micTapInstalled = false
+        }
         input.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
             self?.handleMicBuffer(buffer)
         }
         micTapInstalled = true
 
         do {
-            try startEngineWithRetries()
+            engine.prepare()
+            try engine.start()
+            pendingMicRestart = false
         } catch {
+            // Engine still refusing — drop the tap, reset, and leave the
+            // pending flag set. The next CoreAudio format-change listener
+            // fire (or the watchdog) will re-evaluate.
             if micTapInstalled {
                 engine.inputNode.removeTap(onBus: 0)
                 micTapInstalled = false
             }
-            handleMicLost(
-                reason: "audio engine restart failed after configuration change: \(error.localizedDescription)"
+            engine.reset()
+        }
+    }
+
+    // MARK: - CoreAudio listeners (route-change recovery)
+
+    /// Look up the system default input device.
+    private func currentDefaultInputDevice() -> AudioObjectID {
+        var deviceID = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address, 0, nil, &size, &deviceID
+        )
+        return status == noErr ? deviceID : AudioObjectID(kAudioObjectUnknown)
+    }
+
+    /// Register the system-object listeners (default input + default
+    /// output) and the per-device listeners on whatever the current
+    /// default input is (stream format + IsRunningSomewhere). All fire on
+    /// `coreAudioListenerQueue`; their handlers hop to main before
+    /// touching engine state.
+    private func installCoreAudioListeners() {
+        var defaultInputAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let defaultInputBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.handleDefaultInputDeviceChanged()
+            }
+        }
+        if AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &defaultInputAddress,
+            coreAudioListenerQueue,
+            defaultInputBlock
+        ) == noErr {
+            defaultInputListenerBlock = defaultInputBlock
+        }
+
+        var defaultOutputAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let defaultOutputBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.handleDefaultOutputDeviceChanged()
+            }
+        }
+        if AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &defaultOutputAddress,
+            coreAudioListenerQueue,
+            defaultOutputBlock
+        ) == noErr {
+            defaultOutputListenerBlock = defaultOutputBlock
+        }
+
+        installPerInputListenersOnCurrentDefaultInput()
+    }
+
+    /// Detach every CoreAudio listener. Safe to call multiple times.
+    private func uninstallCoreAudioListeners() {
+        if let block = defaultInputListenerBlock {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultInputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
             )
+            _ = AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                coreAudioListenerQueue,
+                block
+            )
+            defaultInputListenerBlock = nil
+        }
+        if let block = defaultOutputListenerBlock {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            _ = AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                coreAudioListenerQueue,
+                block
+            )
+            defaultOutputListenerBlock = nil
+        }
+        removePerInputListeners()
+    }
+
+    /// Detach both per-input listeners (format + IsRunningSomewhere) from
+    /// whichever device they were attached to (if any).
+    private func removePerInputListeners() {
+        let device = watchedInputDeviceID
+        if device != AudioObjectID(kAudioObjectUnknown) {
+            if let block = formatListenerBlock {
+                var address = AudioObjectPropertyAddress(
+                    mSelector: kAudioDevicePropertyStreamFormat,
+                    mScope: kAudioDevicePropertyScopeInput,
+                    mElement: kAudioObjectPropertyElementMain
+                )
+                _ = AudioObjectRemovePropertyListenerBlock(
+                    device, &address, coreAudioListenerQueue, block
+                )
+            }
+            if let block = runningSomewhereListenerBlock {
+                var address = AudioObjectPropertyAddress(
+                    mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain
+                )
+                _ = AudioObjectRemovePropertyListenerBlock(
+                    device, &address, coreAudioListenerQueue, block
+                )
+            }
+        }
+        formatListenerBlock = nil
+        runningSomewhereListenerBlock = nil
+        watchedInputDeviceID = AudioObjectID(kAudioObjectUnknown)
+    }
+
+    /// Install both per-input listeners (format + IsRunningSomewhere) on
+    /// the *current* system default input device. If no input device is
+    /// present this is a no-op; the default-input listener will re-invoke
+    /// us once one shows up.
+    private func installPerInputListenersOnCurrentDefaultInput() {
+        let device = currentDefaultInputDevice()
+        guard device != AudioObjectID(kAudioObjectUnknown) else { return }
+
+        var formatAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamFormat,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let formatBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            DispatchQueue.main.async {
+                FileHandle.standardError.write(
+                    Data("DBG mic-route: input stream format changed\n".utf8)
+                )
+                self?.attemptMicRestartIfPending()
+            }
+        }
+        if AudioObjectAddPropertyListenerBlock(
+            device, &formatAddress, coreAudioListenerQueue, formatBlock
+        ) == noErr {
+            formatListenerBlock = formatBlock
+        }
+
+        var runningAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let runningBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.handleInputDeviceIsRunningSomewhereChanged()
+            }
+        }
+        if AudioObjectAddPropertyListenerBlock(
+            device, &runningAddress, coreAudioListenerQueue, runningBlock
+        ) == noErr {
+            runningSomewhereListenerBlock = runningBlock
+        }
+
+        watchedInputDeviceID = device
+    }
+
+    /// Detach the per-input listeners and reattach them to whatever device
+    /// is the default input *now*. Called from every event source that may
+    /// have caused the default input to change, so by the time we try to
+    /// restart the engine we're already watching the right device.
+    private func rearmListenersOnCurrentDefaultInput() {
+        let current = currentDefaultInputDevice()
+        if current == watchedInputDeviceID
+            && formatListenerBlock != nil
+            && runningSomewhereListenerBlock != nil {
+            return
+        }
+        removePerInputListeners()
+        installPerInputListenersOnCurrentDefaultInput()
+    }
+
+    /// Read `kAudioDevicePropertyDeviceIsRunningSomewhere` for `deviceID`.
+    /// Returns false on any CoreAudio error — the caller treats false the
+    /// same as "the input isn't flowing", which is the safer default.
+    private func isInputDeviceRunning(_ deviceID: AudioObjectID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(
+            deviceID, &address, 0, nil, &size, &value
+        )
+        return status == noErr && value != 0
+    }
+
+    /// Default input changed (e.g. AirPods became default *input*). The
+    /// engine's tap is bound to the old input, so a full restart is
+    /// always warranted.
+    private func handleDefaultInputDeviceChanged() {
+        FileHandle.standardError.write(
+            Data("DBG mic-route: default input device changed\n".utf8)
+        )
+        triggerMicRestart(reason: "default input device changed")
+    }
+
+    /// Default *output* changed (e.g. AirPods became default output even
+    /// though the input device didn't change). This sometimes silently
+    /// causes the OS to stop I/O on the current input AU. Restart only if
+    /// the input is now actually stopped — otherwise this is a benign
+    /// output swap (external speakers, etc.) and we'd be tearing down a
+    /// working engine for nothing.
+    private func handleDefaultOutputDeviceChanged() {
+        FileHandle.standardError.write(
+            Data("DBG mic-route: default output device changed\n".utf8)
+        )
+        let device = watchedInputDeviceID
+        if device == AudioObjectID(kAudioObjectUnknown) {
+            return
+        }
+        if isInputDeviceRunning(device) {
+            FileHandle.standardError.write(
+                Data("DBG mic-route: input still running, no restart\n".utf8)
+            )
+            return
+        }
+        triggerMicRestart(reason: "default output changed and input stopped")
+    }
+
+    /// `DeviceIsRunningSomewhere` on the watched input toggled. If it went
+    /// to false the OS has stopped I/O on the mic (the exact failure mode
+    /// behind the AirPods-as-output-only bug); restart. If it went to true
+    /// somebody (perhaps us, perhaps another app) is driving the device —
+    /// if a restart is pending, this is a hint to retry it now.
+    private func handleInputDeviceIsRunningSomewhereChanged() {
+        let device = watchedInputDeviceID
+        if device == AudioObjectID(kAudioObjectUnknown) { return }
+        let running = isInputDeviceRunning(device)
+        FileHandle.standardError.write(
+            Data("DBG mic-route: input IsRunningSomewhere=\(running)\n".utf8)
+        )
+        if running {
+            attemptMicRestartIfPending()
+        } else {
+            triggerMicRestart(reason: "input device IsRunningSomewhere=false")
         }
     }
 
@@ -627,6 +1034,11 @@ final class AudioCapture: NSObject {
         if engine.isRunning {
             engine.stop()
         }
+        // Mic is permanently gone for this capture — no point keeping the
+        // CoreAudio listeners armed; they'd just keep firing on subsequent
+        // route changes with nothing to do.
+        uninstallCoreAudioListeners()
+        pendingMicRestart = false
 
         // Drain whatever is buffered into the mic writer, then close it so the
         // file is finalized at the point of failure. `finalizeWriters` will
