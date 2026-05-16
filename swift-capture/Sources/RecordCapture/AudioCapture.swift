@@ -689,15 +689,54 @@ final class AudioCapture: NSObject {
 
     // MARK: - System-audio sample handler
 
+    // Diagnostic counters for the empty-system.wav bug. All accessed only on
+    // `sampleQueue` (SCStream's sample-handler queue is serial per Apple's
+    // contract), so plain Ints are race-free. Temporary — remove once the
+    // root cause is found.
+    private var dbgSysEntered: Int = 0
+    private var dbgSysReady: Int = 0
+    private var dbgSysPcm: Int = 0
+    private var dbgSysConverted: Int = 0
+    private var dbgSysEnqueued: Int = 0
+
+    private func dbgLogSys(_ tag: String, _ extra: String = "") {
+        let msg = "DBG sys-audio \(tag) entered=\(dbgSysEntered) ready=\(dbgSysReady) pcm=\(dbgSysPcm) converted=\(dbgSysConverted) enqueued=\(dbgSysEnqueued) \(extra)\n"
+        FileHandle.standardError.write(Data(msg.utf8))
+    }
+
     fileprivate func handleSystemBuffer(_ sampleBuffer: CMSampleBuffer) {
+        dbgSysEntered += 1
+        if dbgSysEntered == 1 || dbgSysEntered % 200 == 0 {
+            dbgLogSys("enter")
+        }
         guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
-        guard let inputBuffer = makePCMBuffer(from: sampleBuffer) else { return }
+        dbgSysReady += 1
+        guard let inputBuffer = makePCMBuffer(from: sampleBuffer) else {
+            if dbgSysReady - dbgSysPcm <= 3 {
+                dbgLogSys("drop:makePCMBuffer-nil")
+            }
+            return
+        }
+        dbgSysPcm += 1
+        if dbgSysPcm == 1 {
+            dbgLogSys("first-pcm", "frames=\(inputBuffer.frameLength) fmt=\(inputBuffer.format)")
+        }
         guard let outputBuffer = convert(
             inputBuffer,
             converter: &systemConverter,
             converterInputFormat: &systemConverterInputFormat
-        ) else { return }
+        ) else {
+            if dbgSysPcm - dbgSysConverted <= 3 {
+                dbgLogSys("drop:convert-nil")
+            }
+            return
+        }
+        dbgSysConverted += 1
+        if dbgSysConverted == 1 {
+            dbgLogSys("first-converted", "frames=\(outputBuffer.frameLength)")
+        }
         enqueue(buffer: outputBuffer, into: systemQueue)
+        dbgSysEnqueued += 1
     }
 
     // MARK: - Mic tap handler
@@ -976,10 +1015,17 @@ final class AudioCapture: NSObject {
         guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbdPointer = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc)
         else {
+            if dbgSysPcm == 0 && dbgSysReady < 5 {
+                FileHandle.standardError.write(Data("DBG makePCMBuffer fail: no formatDesc/asbd\n".utf8))
+            }
             return nil
         }
         var asbd = asbdPointer.pointee
         guard let format = AVAudioFormat(streamDescription: &asbd) else {
+            if dbgSysPcm == 0 && dbgSysReady < 5 {
+                let msg = "DBG makePCMBuffer fail: AVAudioFormat(streamDescription:) returned nil; asbd sr=\(asbd.mSampleRate) fmtID=\(asbd.mFormatID) flags=\(asbd.mFormatFlags) bytesPerPacket=\(asbd.mBytesPerPacket) framesPerPacket=\(asbd.mFramesPerPacket) bytesPerFrame=\(asbd.mBytesPerFrame) chans=\(asbd.mChannelsPerFrame) bitsPerChannel=\(asbd.mBitsPerChannel)\n"
+                FileHandle.standardError.write(Data(msg.utf8))
+            }
             return nil
         }
 
@@ -987,17 +1033,46 @@ final class AudioCapture: NSObject {
         guard frameCount > 0,
               let pcmBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)
         else {
+            if dbgSysPcm == 0 && dbgSysReady < 5 {
+                FileHandle.standardError.write(Data("DBG makePCMBuffer fail: frameCount=\(frameCount) or AVAudioPCMBuffer alloc nil\n".utf8))
+            }
             return nil
         }
         pcmBuffer.frameLength = frameCount
 
+        // Discover the required ABL size — for non-interleaved stereo (SCK's
+        // default audio shape) we need room for one AudioBuffer per channel,
+        // not the single-buffer stack allocation. CoreMedia returns
+        // kCMSampleBufferError_ArrayTooSmall (-12737) if `bufferListSize` is
+        // smaller than required.
+        var ablSize: Int = 0
+        let sizeStatus = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &ablSize,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: 0,
+            blockBufferOut: nil
+        )
+        guard sizeStatus == noErr, ablSize > 0 else {
+            return nil
+        }
+
+        let ablPtr = UnsafeMutableRawPointer.allocate(
+            byteCount: ablSize,
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { ablPtr.deallocate() }
+        let ablTyped = ablPtr.bindMemory(to: AudioBufferList.self, capacity: 1)
+
         var blockBufferOut: CMBlockBuffer?
-        var audioBufferList = AudioBufferList()
         let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
             sampleBuffer,
             bufferListSizeNeededOut: nil,
-            bufferListOut: &audioBufferList,
-            bufferListSize: MemoryLayout<AudioBufferList>.size,
+            bufferListOut: ablTyped,
+            bufferListSize: ablSize,
             blockBufferAllocator: nil,
             blockBufferMemoryAllocator: nil,
             flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
@@ -1009,7 +1084,7 @@ final class AudioCapture: NSObject {
         // For interleaved formats there is one buffer; for non-interleaved
         // there is one per channel. Use UnsafeMutableAudioBufferListPointer
         // to walk both lists.
-        let sourceList = UnsafeMutableAudioBufferListPointer(&audioBufferList)
+        let sourceList = UnsafeMutableAudioBufferListPointer(ablTyped)
         let destList = UnsafeMutableAudioBufferListPointer(pcmBuffer.mutableAudioBufferList)
         let pairCount = min(sourceList.count, destList.count)
         for i in 0..<pairCount {

@@ -31,3 +31,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+  "real_capture: hits the real macOS capture pipeline; needs BlackHole + SwitchAudioSource + TCC. Opt-in via --run-real-capture.",
+]

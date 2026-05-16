@@ -51,8 +51,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # — the sibling .gitignore in .claude/skills/implement/ handles that.
 LOG_DIR = SCRIPT_DIR.parent / "logs"
 
-SLICE_HEADING = re.compile(r"^##\s+Slice\s+(\d+)\b", re.MULTILINE)
-SUB_UNCHECKED = re.compile(r"^\s+-\s+\[\s\]", re.MULTILINE)
+SLICE_HEADING = re.compile(
+    r"^#{2,}\s+(?:-\s+\[[ xX]\]\s+)?(?:\*\*)?Slice\s+(\d+)\b",
+    re.MULTILINE,
+)
+SUB_UNCHECKED = re.compile(
+    r"^\s*-\s+\[\s\](?!\s*\*\*Slice\s+\d)",
+    re.MULTILINE,
+)
 
 
 def emit(event: dict) -> None:
@@ -62,8 +68,9 @@ def emit(event: dict) -> None:
 def parse_slice_unchecked(text: str) -> dict[int, int]:
     """Return {slice_num: count_of_unchecked_sub_items}.
 
-    Counts only indented (sub-item) checkboxes; the slice rollup line
-    (`- [ ] **Slice N: ...**` with no leading whitespace) is excluded.
+    Counts sub-item checkboxes (with or without leading indentation); the slice
+    rollup line (`- [ ] **Slice N: ...**`) is excluded via negative lookahead.
+    Supports both `## Slice N — ...` and `### - [ ] **Slice N: ...**` headings.
     """
     lines = text.splitlines()
     starts: list[tuple[int, int]] = []

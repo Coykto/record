@@ -1,4 +1,4 @@
-.PHONY: swift install test
+.PHONY: swift install test test-real
 
 swift:
 	swift build -c release --package-path swift-capture
@@ -30,3 +30,16 @@ test: swift
 		*/Xcode.app/*) swift test --package-path swift-capture ;; \
 		*) echo "swift test skipped: XCTest unavailable -- install full Xcode to enable Swift unit tests" ;; \
 	esac
+
+# Real-capture end-to-end test (opt-in; not run by `make test`).
+#
+# Prerequisites (one-time setup):
+#   brew install --cask blackhole-2ch
+#   brew install switchaudio-osx
+#   Grant Screen Recording + Microphone permission to record-capture
+#     (System Settings -> Privacy & Security; the binary prompts on first run).
+#
+# Heads-up: during this test, audio is routed through BlackHole - your
+# Mac will look silent for ~4 seconds. That's expected.
+test-real: swift
+	uv run pytest tests/integration/test_real_capture.py --run-real-capture -v

@@ -1,6 +1,7 @@
 import Foundation
 import ScreenCaptureKit
 import AppKit
+import AVFoundation
 
 // MARK: - Stdout: line-buffered, single-line JSON events
 
@@ -88,6 +89,15 @@ struct CLIFlags {
     /// caches at process launch, so a *fresh* process is the only way to observe
     /// a grant made after priming started.
     var checkScreenRecording: Bool = false
+    /// When true, the binary runs a non-prompting TCC probe for Screen
+    /// Recording and Microphone, emits two JSON-line `permission` events on
+    /// stdout, and exits 0. Used by the real-capture e2e test pre-flight
+    /// (`make test-real`) to decide whether to run the suite or skip with a
+    /// clear "grant TCC first" message. Distinct from `--prime-permissions`
+    /// in that it never calls `requestAccess`; on a clean machine the
+    /// `SCShareableContent.current` call may still trigger the macOS TCC
+    /// prompt (documented in spec 006 §2.7), but no explicit request is made.
+    var checkPermissions: Bool = false
     /// When non-nil, schedule `AudioCapture.handleMicLost(...)` N seconds
     /// after sources start. Only meaningful in synthetic-audio mode
     /// (`--test-silent-sources`); in production mode the value is parsed but
@@ -144,6 +154,13 @@ func parseCLIFlags() -> CLIFlags {
             // Screen Recording authorization via the exit code; see
             // `CLIFlags.checkScreenRecording`.
             flags.checkScreenRecording = true
+            i += 1
+        case "--check-permissions":
+            // Order-independent boolean flag, no value argument. Emits two
+            // `permission` JSON lines on stdout (screen_recording, then
+            // microphone) and exits 0. Non-prompting probe; see
+            // `CLIFlags.checkPermissions`.
+            flags.checkPermissions = true
             i += 1
         case "--simulate-video-failure-after-seconds":
             // Consume the following positional value. Accept either an Int or
@@ -223,6 +240,62 @@ if cliFlags.primePermissions {
     Task {
         let allGranted = await Permissions.prime(emit: emit)
         exit(allGranted ? 0 : 1)
+    }
+    dispatchMain()
+}
+
+// Non-prompting TCC probe for the real-capture e2e test pre-flight (spec 006
+// §2.7). Emits exactly two JSON lines on stdout — `screen_recording` first,
+// then `microphone` — and exits 0 regardless of outcome. The test harness
+// interprets the events; the exit code is not load-bearing.
+//
+// Important contract differences vs `--prime-permissions`:
+//   - No `requestAccess` is ever called. `AVCaptureDevice.authorizationStatus`
+//     is a pure read.
+//   - `SCShareableContent.current` is technically not a "request", but on a
+//     clean machine with no prior decision it *will* surface the macOS TCC
+//     dialog. That's accepted per the spec's risk analysis — first run on a
+//     fresh machine prompts; subsequent runs are silent.
+//   - Event shape is brand-new (`{"event":"permission", ...}`) and is not
+//     part of the wider IPC protocol — it lives only on this one-shot mode,
+//     so we write it directly rather than threading a new case through
+//     `Event` / `IPCCodec`.
+if cliFlags.checkPermissions {
+    Task {
+        // Screen Recording: `SCShareableContent.current` returns content when
+        // granted and throws (canonically `SCStreamError.notAuthorized`, but
+        // any throw counts as not-granted here) when not.
+        var screenGranted = false
+        do {
+            _ = try await SCShareableContent.current
+            screenGranted = true
+        } catch {
+            screenGranted = false
+        }
+        let screenLine = #"{"event":"permission","name":"screen_recording","granted":"# +
+            (screenGranted ? "true" : "false") + "}\n"
+        FileHandle.standardOutput.write(Data(screenLine.utf8))
+        fflush(stdout)
+
+        // Microphone: pure status read; .authorized → true, everything else
+        // (including .notDetermined, .denied, .restricted, future unknowns)
+        // → false. Never call `requestAccess` here.
+        let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        let micGranted: Bool
+        switch micStatus {
+        case .authorized:
+            micGranted = true
+        case .notDetermined, .denied, .restricted:
+            micGranted = false
+        @unknown default:
+            micGranted = false
+        }
+        let micLine = #"{"event":"permission","name":"microphone","granted":"# +
+            (micGranted ? "true" : "false") + "}\n"
+        FileHandle.standardOutput.write(Data(micLine.utf8))
+        fflush(stdout)
+
+        exit(0)
     }
     dispatchMain()
 }
