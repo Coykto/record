@@ -47,9 +47,9 @@ def recorder(monkeypatch: pytest.MonkeyPatch) -> _PopenRecorder:
 # ---------------------------------------------------------------------------
 
 
-def test_play_start_invokes_afplay_with_tink(recorder: _PopenRecorder) -> None:
+def test_play_start_invokes_afplay_with_submarine(recorder: _PopenRecorder) -> None:
     feedback.play_start()
-    assert recorder.calls == [["/usr/bin/afplay", "/System/Library/Sounds/Tink.aiff"]]
+    assert recorder.calls == [["/usr/bin/afplay", "/System/Library/Sounds/Submarine.aiff"]]
 
 
 def test_play_stop_invokes_afplay_with_pop(recorder: _PopenRecorder) -> None:
@@ -186,7 +186,7 @@ def test_notify_swallows_os_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_module_exports_sound_constants() -> None:
     """The three sound paths are public — tests + daemon both reference them."""
-    assert feedback.START_SOUND == "/System/Library/Sounds/Tink.aiff"
+    assert feedback.START_SOUND == "/System/Library/Sounds/Submarine.aiff"
     assert feedback.STOP_SOUND == "/System/Library/Sounds/Pop.aiff"
     assert feedback.ERROR_SOUND == "/System/Library/Sounds/Funk.aiff"
     assert "START_SOUND" in feedback.__all__

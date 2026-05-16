@@ -1,7 +1,7 @@
 """Audible feedback + macOS notification banner surface.
 
 Spec 003 / tech spec §2.9. The daemon plays a short macOS built-in sound at
-each capture-state transition (Tink on start, Pop on stop, Funk on failure)
+each capture-state transition (Submarine on start, Pop on stop, Funk on failure)
 and surfaces a notification banner on error conditions the user must see —
 notably "hotkey pressed but capture cannot start" (FR 2.8) and daemon-level
 warnings like missing Accessibility permission.
@@ -48,7 +48,7 @@ _log = get_logger("record.feedback")
 # ---------------------------------------------------------------------------
 
 #: Played on a successful capture start (FR 2.8 first bullet).
-START_SOUND: str = "/System/Library/Sounds/Tink.aiff"
+START_SOUND: str = "/System/Library/Sounds/Submarine.aiff"
 
 #: Played on a successful capture stop (FR 2.8 second bullet).
 STOP_SOUND: str = "/System/Library/Sounds/Pop.aiff"
@@ -82,7 +82,7 @@ def _play(path: str) -> None:
 
 
 def play_start(*, enabled: bool = True) -> None:
-    """Play the capture-start sound (Tink). No-op when ``enabled=False``."""
+    """Play the capture-start sound (Submarine). No-op when ``enabled=False``."""
     if not enabled:
         return
     _play(START_SOUND)

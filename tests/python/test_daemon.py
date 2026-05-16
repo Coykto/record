@@ -982,11 +982,11 @@ def test_audible_feedback_off_silences_start_and_stop_sounds(
 def test_socket_driven_start_ok_plays_start_not_error(
     daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A successful ``record start`` over the socket → Tink, never Funk.
+    """A successful ``record start`` over the socket → start sound, never Funk.
 
     The error-sound + banner branch is hotkey-specific (FR 2.8 third bullet
     wording). Socket-driven starts that succeed take the unconditional
-    happy-path Tink (FR 2.8 first bullet).
+    happy-path start sound (FR 2.8 first bullet).
     """
     stub = _install_feedback_stub(monkeypatch)
     d, _sessions = _make_daemon(daemon_paths)

@@ -11,7 +11,7 @@ record install    # register the daemon to autostart on login, and start it now
 
 `record install` primes the macOS permission prompts (grant them when asked), writes the LaunchAgent, and bootstraps the daemon. After that, the everyday flow has no terminal in it:
 
-- Press **⌥⌘R** (Option + Command + R) to start a capture — you'll hear a short "Tink".
+- Press **⌥⌘R** (Option + Command + R) to start a capture — you'll hear a short "Submarine" ping.
 - Press **⌥⌘R** again to stop — you'll hear a short "Pop".
 - Recordings land in `~/record/` as a paired set: `<timestamp>-mic.wav`, `<timestamp>-system.wav`, and `<timestamp>.mp4`.
 
@@ -134,7 +134,7 @@ The recording itself behaves exactly as it did in the pre-daemon build:
 
 Each scenario starts from a clean state — `record uninstall` then `record install`.
 
-1. **Hotkey happy path.** Press ⌥⌘R from a focused Chrome tab in a Google Meet session → Tink sound. Speak for ~30 s. Press ⌥⌘R again → Pop sound. Verify all three files in `~/record/` (`-mic.wav`, `-system.wav`, `.mp4`) play back; the mic file contains your voice, the system file contains the meeting audio, and the video shows the primary display.
+1. **Hotkey happy path.** Press ⌥⌘R from a focused Chrome tab in a Google Meet session → Submarine sound. Speak for ~30 s. Press ⌥⌘R again → Pop sound. Verify all three files in `~/record/` (`-mic.wav`, `-system.wav`, `.mp4`) play back; the mic file contains your voice, the system file contains the meeting audio, and the video shows the primary display.
 2. **Terminal-CLI parity.** `record start` from a terminal → press the hotkey to stop. All files finalize via the same daemon path. Confirm `record status` between phases shows the correct state.
 3. **Hotkey conflict.** Bind ⌥⌘R in another app (e.g. a Keyboard Maestro macro) → `record daemon restart` → press the hotkey → the other app fires, not `record`. `record status` reports the hotkey may be inactive. Unbind in the other app → `record daemon restart` → the hotkey works again.
 4. **Accessibility denied.** Revoke Accessibility for the daemon's binary in System Settings → `record daemon restart`. The daemon runs, no hotkey, a notification banner names Accessibility. `record start` from the terminal still works.

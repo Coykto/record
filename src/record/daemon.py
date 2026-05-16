@@ -347,7 +347,7 @@ class Daemon:
         self._background.add(watcher)
         watcher.add_done_callback(self._background.discard)
 
-        # Slice 6: FR 2.8 first bullet. Tink fires on every successful
+        # Slice 6: FR 2.8 first bullet. The start sound fires on every successful
         # IDLE→RUNNING regardless of the input channel that triggered it
         # (hotkey or socket-driven ``record start``).
         self._safe_play_start()
