@@ -371,9 +371,9 @@ final class CaptureState {
     let videoSource: VideoSource?
     let displayMonitor: DisplayReconfigurationMonitor?
     let systemEventMonitor: SystemEventMonitor?
-    /// Audio output basename (no extension). The two per-source WAVs are
-    /// `<basename>-mic.wav` and `<basename>-system.wav`; the basename itself
-    /// is carried back to the orchestrator on the `stopped` event.
+    /// Audio output directory. The two per-source WAVs are
+    /// `<basename>/mic.wav` and `<basename>/system.wav`; the directory path
+    /// itself is carried back to the orchestrator on the `stopped` event.
     let basename: String
     let videoOutputPath: String?
     let startedAt: Date
@@ -471,8 +471,9 @@ func handleStart(
         return
     }
 
-    // `outputPath` on the wire is now a basename without extension; the
-    // capture backend derives `<basename>-mic.wav` and `<basename>-system.wav`.
+    // `outputPath` on the wire is a directory (created by the orchestrator
+    // before `start`); the capture backend writes `mic.wav` and `system.wav`
+    // inside it.
     let basenameURL = URL(fileURLWithPath: outputPath)
 
     let audioCapture: AudioCapture

@@ -190,24 +190,25 @@ def test_start_happy_path_prints_paths_from_response(
 
     def _handler(req: control.ControlRequest) -> control.ControlResponse:
         assert isinstance(req, control.StartRequest)
+        # Spec 008: per-session subfolder; audio/video files live inside it.
         return control.ControlResponse(
             status="ok",
             capture_id="2026-05-13T09-21-48",
-            audio_path="/abs/2026-05-13T09-21-48-mic.wav",
+            audio_path="/abs/2026-05-13T09-21-48/mic.wav",
             audio_paths={
-                "mic": "/abs/2026-05-13T09-21-48-mic.wav",
-                "system_audio": "/abs/2026-05-13T09-21-48-system.wav",
+                "mic": "/abs/2026-05-13T09-21-48/mic.wav",
+                "system_audio": "/abs/2026-05-13T09-21-48/system.wav",
             },
-            video_path="/abs/2026-05-13T09-21-48.mp4",
+            video_path="/abs/2026-05-13T09-21-48/video.mp4",
         )
 
     srv = stub_server(_handler)
     result = runner.invoke(cli.app, ["start"])
     assert result.exit_code == 0, result.stderr
     assert "capture started" in result.stdout
-    assert "/abs/2026-05-13T09-21-48-mic.wav" in result.stdout
-    assert "/abs/2026-05-13T09-21-48-system.wav" in result.stdout
-    assert "/abs/2026-05-13T09-21-48.mp4" in result.stdout
+    assert "/abs/2026-05-13T09-21-48/mic.wav" in result.stdout
+    assert "/abs/2026-05-13T09-21-48/system.wav" in result.stdout
+    assert "/abs/2026-05-13T09-21-48/video.mp4" in result.stdout
     assert len(srv.calls) == 1
     assert isinstance(srv.calls[0], control.StartRequest)
 
@@ -305,15 +306,17 @@ def test_stop_happy_path_renders_summary_from_state_file(
     stub_server: Any, fake_paths: dict[str, Path]
 ) -> None:
     """Daemon responds ok → CLI re-reads capture-state.json → prints summary."""
+    # Spec 008: every capture artefact lives inside ``<basename>/`` (the
+    # per-session folder). ``basename`` itself is now that folder's path.
     fake_paths["state"].write_text(
         (
             '{"basename": "/abs/x", "duration_seconds": 42.5, '
             '"audio_files": {'
-            '"mic": {"path": "/abs/x-mic.wav", "status": "captured_normally", '
+            '"mic": {"path": "/abs/x/mic.wav", "status": "captured_normally", '
             '"duration_seconds": 42.5, "truncated_at_offset_seconds": null}, '
-            '"system_audio": {"path": "/abs/x-system.wav", "status": "captured_normally", '
+            '"system_audio": {"path": "/abs/x/system.wav", "status": "captured_normally", '
             '"duration_seconds": 42.5, "truncated_at_offset_seconds": null}}, '
-            '"combined_audio": {"path": "/abs/x.wav", "status": "produced", '
+            '"combined_audio": {"path": "/abs/x/combined.wav", "status": "produced", '
             '"duration_seconds": 42.5}, '
             '"sources": {"mic": {"status": "attached"}, '
             '"system_audio": {"status": "attached"}, '
@@ -327,10 +330,10 @@ def test_stop_happy_path_renders_summary_from_state_file(
         assert isinstance(req, control.StopRequest)
         return control.ControlResponse(
             status="ok",
-            audio_path="/abs/x-mic.wav",
+            audio_path="/abs/x/mic.wav",
             audio_paths={
-                "mic": "/abs/x-mic.wav",
-                "system_audio": "/abs/x-system.wav",
+                "mic": "/abs/x/mic.wav",
+                "system_audio": "/abs/x/system.wav",
             },
             video_path=None,
         )
@@ -339,12 +342,12 @@ def test_stop_happy_path_renders_summary_from_state_file(
     result = runner.invoke(cli.app, ["stop"])
     assert result.exit_code == 0, result.stderr
     assert "capture stopped" in result.stdout
-    assert "/abs/x-mic.wav" in result.stdout
-    assert "/abs/x-system.wav" in result.stdout
+    assert "/abs/x/mic.wav" in result.stdout
+    assert "/abs/x/system.wav" in result.stdout
     assert "captured normally" in result.stdout
     assert "microphone + system audio" in result.stdout
     # Spec 007 slice 2: the combined-file line is rendered on success.
-    assert "combined: /abs/x.wav" in result.stdout
+    assert "combined: /abs/x/combined.wav" in result.stdout
     assert "produced" in result.stdout
 
 
@@ -352,13 +355,14 @@ def test_stop_summary_renders_truncated_at_offset_for_mic(
     stub_server: Any, fake_paths: dict[str, Path]
 ) -> None:
     """A mic file with status=truncated_at_offset renders MM:SS + 'file ends there'."""
+    # Spec 008: mic/system live inside the per-session folder.
     fake_paths["state"].write_text(
         (
             '{"basename": "/abs/x", "duration_seconds": 200.0, '
             '"audio_files": {'
-            '"mic": {"path": "/abs/x-mic.wav", "status": "truncated_at_offset", '
+            '"mic": {"path": "/abs/x/mic.wav", "status": "truncated_at_offset", '
             '"duration_seconds": 134.0, "truncated_at_offset_seconds": 134.0}, '
-            '"system_audio": {"path": "/abs/x-system.wav", "status": "captured_normally", '
+            '"system_audio": {"path": "/abs/x/system.wav", "status": "captured_normally", '
             '"duration_seconds": 200.0, "truncated_at_offset_seconds": null}}, '
             '"sources": {"mic": {"status": "attached"}, '
             '"system_audio": {"status": "attached"}, '
@@ -390,19 +394,23 @@ def test_humanize_audio_file_status_silent_throughout() -> None:
 
 
 def _base_final(combined_audio: dict | None) -> dict:
-    """Minimal ``final`` payload for `_print_stop_summary` rendering tests."""
+    """Minimal ``final`` payload for `_print_stop_summary` rendering tests.
+
+    Spec 008: ``basename`` is the per-session directory; mic/system/combined
+    all live inside it.
+    """
     final: dict = {
         "basename": "/abs/x",
         "duration_seconds": 30.0,
         "audio_files": {
             "mic": {
-                "path": "/abs/x-mic.wav",
+                "path": "/abs/x/mic.wav",
                 "status": "captured_normally",
                 "duration_seconds": 30.0,
                 "truncated_at_offset_seconds": None,
             },
             "system_audio": {
-                "path": "/abs/x-system.wav",
+                "path": "/abs/x/system.wav",
                 "status": "captured_normally",
                 "duration_seconds": 30.0,
                 "truncated_at_offset_seconds": None,
@@ -428,14 +436,14 @@ def test_print_stop_summary_combined_produced_line_shape(
     cli._print_stop_summary(
         _base_final(
             {
-                "path": "/abs/x.wav",
+                "path": "/abs/x/combined.wav",
                 "status": "produced",
                 "duration_seconds": 30.0,
             }
         )
     )
     out = capsys.readouterr().out
-    assert "  combined: /abs/x.wav   30.0 s   produced" in out
+    assert "  combined: /abs/x/combined.wav   30.0 s   produced" in out
 
 
 def test_print_stop_summary_combined_failed_line_shape(
@@ -445,14 +453,14 @@ def test_print_stop_summary_combined_failed_line_shape(
     cli._print_stop_summary(
         _base_final(
             {
-                "path": "/abs/x.wav",
+                "path": "/abs/x/combined.wav",
                 "status": "failed",
                 "reason": "disk full",
             }
         )
     )
     out = capsys.readouterr().out
-    assert "  combined: /abs/x.wav   not produced — disk full" in out
+    assert "  combined: /abs/x/combined.wav   not produced — disk full" in out
 
 
 def test_print_stop_summary_combined_key_absent_emits_no_line(
@@ -537,8 +545,9 @@ def test_status_running_capture(stub_server: Any) -> None:
             capture=control.CaptureState(
                 running=True,
                 started_at="2026-05-13T09:20:00Z",
-                audio_path="/abs/x.wav",
-                video_path="/abs/x.mp4",
+                # Spec 008: per-session subfolder layout.
+                audio_path="/abs/x/mic.wav",
+                video_path="/abs/x/video.mp4",
             ),
         )
 
@@ -546,8 +555,8 @@ def test_status_running_capture(stub_server: Any) -> None:
     result = runner.invoke(cli.app, ["status"])
     assert result.exit_code == 0
     assert "capture: running" in result.stdout
-    assert "/abs/x.wav" in result.stdout
-    assert "/abs/x.mp4" in result.stdout
+    assert "/abs/x/mic.wav" in result.stdout
+    assert "/abs/x/video.mp4" in result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -695,17 +704,19 @@ def test_summary_video_warning_not_duplicated_as_generic_warning() -> None:
 def test_stop_summary_video_attached_renders_path_and_dimensions(
     stub_server: Any, fake_paths: dict[str, Path]
 ) -> None:
+    # Spec 008: per-session folder ``/abs/2026-05-11T12-00-00/`` holds every
+    # artefact.
     fake_paths["state"].write_text(
         (
             '{"basename": "/abs/2026-05-11T12-00-00", '
             '"audio_files": {'
-            '"mic": {"path": "/abs/2026-05-11T12-00-00-mic.wav", '
+            '"mic": {"path": "/abs/2026-05-11T12-00-00/mic.wav", '
             '"status": "captured_normally", "duration_seconds": 12.3, '
             '"truncated_at_offset_seconds": null}, '
-            '"system_audio": {"path": "/abs/2026-05-11T12-00-00-system.wav", '
+            '"system_audio": {"path": "/abs/2026-05-11T12-00-00/system.wav", '
             '"status": "captured_normally", "duration_seconds": 12.3, '
             '"truncated_at_offset_seconds": null}}, '
-            '"video_output_path": "/abs/2026-05-11T12-00-00.mp4", '
+            '"video_output_path": "/abs/2026-05-11T12-00-00/video.mp4", '
             '"duration_seconds": 12.3, "video_file_duration_seconds": 12.3, '
             '"sources": {"mic": {"status": "attached"}, '
             '"system_audio": {"status": "attached"}, '
@@ -719,7 +730,7 @@ def test_stop_summary_video_attached_renders_path_and_dimensions(
     assert result.exit_code == 0, result.stderr
     assert "capture stopped" in result.stdout
     assert (
-        "video: /abs/2026-05-11T12-00-00.mp4 (12.3 s, 2560×1440)"
+        "video: /abs/2026-05-11T12-00-00/video.mp4 (12.3 s, 2560×1440)"
         in result.stdout
     )
 
@@ -727,14 +738,15 @@ def test_stop_summary_video_attached_renders_path_and_dimensions(
 def test_stop_summary_video_lost_offset_zero_renders_unavailable(
     stub_server: Any, fake_paths: dict[str, Path]
 ) -> None:
+    # Spec 008: per-session folder layout.
     fake_paths["state"].write_text(
         (
             '{"basename": "/abs/2026-05-11T12-00-00", '
             '"audio_files": {'
-            '"mic": {"path": "/abs/2026-05-11T12-00-00-mic.wav", '
+            '"mic": {"path": "/abs/2026-05-11T12-00-00/mic.wav", '
             '"status": "captured_normally", "duration_seconds": 9.5, '
             '"truncated_at_offset_seconds": null}, '
-            '"system_audio": {"path": "/abs/2026-05-11T12-00-00-system.wav", '
+            '"system_audio": {"path": "/abs/2026-05-11T12-00-00/system.wav", '
             '"status": "captured_normally", "duration_seconds": 9.5, '
             '"truncated_at_offset_seconds": null}}, '
             '"video_output_path": null, "duration_seconds": 9.5, '
@@ -756,17 +768,18 @@ def test_stop_summary_video_lost_offset_zero_renders_unavailable(
 def test_stop_summary_video_lost_mid_capture_renders_path_and_offset(
     stub_server: Any, fake_paths: dict[str, Path]
 ) -> None:
+    # Spec 008: per-session folder layout.
     fake_paths["state"].write_text(
         (
             '{"basename": "/abs/2026-05-11T12-00-00", '
             '"audio_files": {'
-            '"mic": {"path": "/abs/2026-05-11T12-00-00-mic.wav", '
+            '"mic": {"path": "/abs/2026-05-11T12-00-00/mic.wav", '
             '"status": "captured_normally", "duration_seconds": 200.0, '
             '"truncated_at_offset_seconds": null}, '
-            '"system_audio": {"path": "/abs/2026-05-11T12-00-00-system.wav", '
+            '"system_audio": {"path": "/abs/2026-05-11T12-00-00/system.wav", '
             '"status": "captured_normally", "duration_seconds": 200.0, '
             '"truncated_at_offset_seconds": null}}, '
-            '"video_output_path": "/abs/2026-05-11T12-00-00.mp4", '
+            '"video_output_path": "/abs/2026-05-11T12-00-00/video.mp4", '
             '"duration_seconds": 200.0, '
             '"sources": {"mic": {"status": "attached"}, '
             '"system_audio": {"status": "attached"}, '
@@ -780,7 +793,7 @@ def test_stop_summary_video_lost_mid_capture_renders_path_and_offset(
     result = runner.invoke(cli.app, ["stop"])
     assert result.exit_code == 0, result.stderr
     assert (
-        "video: /abs/2026-05-11T12-00-00.mp4 — stopped at 02:14, reason sc_stream_error"
+        "video: /abs/2026-05-11T12-00-00/video.mp4 — stopped at 02:14, reason sc_stream_error"
         in result.stdout
     )
 
@@ -788,17 +801,18 @@ def test_stop_summary_video_lost_mid_capture_renders_path_and_offset(
 def test_stop_summary_video_never_attached_renders_status(
     stub_server: Any, fake_paths: dict[str, Path]
 ) -> None:
+    # Spec 008: per-session folder layout.
     fake_paths["state"].write_text(
         (
             '{"basename": "/abs/2026-05-11T12-00-00", '
             '"audio_files": {'
-            '"mic": {"path": "/abs/2026-05-11T12-00-00-mic.wav", '
+            '"mic": {"path": "/abs/2026-05-11T12-00-00/mic.wav", '
             '"status": "captured_normally", "duration_seconds": 3.0, '
             '"truncated_at_offset_seconds": null}, '
-            '"system_audio": {"path": "/abs/2026-05-11T12-00-00-system.wav", '
+            '"system_audio": {"path": "/abs/2026-05-11T12-00-00/system.wav", '
             '"status": "captured_normally", "duration_seconds": 3.0, '
             '"truncated_at_offset_seconds": null}}, '
-            '"video_output_path": "/abs/2026-05-11T12-00-00.mp4", '
+            '"video_output_path": "/abs/2026-05-11T12-00-00/video.mp4", '
             '"duration_seconds": 3.0, '
             '"sources": {"mic": {"status": "attached"}, '
             '"system_audio": {"status": "attached"}, '

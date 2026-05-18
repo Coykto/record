@@ -121,9 +121,14 @@ def test_two_track_audio_no_cross_talk(
     capture_binary: Path, tmp_path: Path
 ) -> None:
     """Mic file is 440 Hz only; system file is 880 Hz only; both ≈1.5 s."""
-    output_basename = tmp_path / "two-track"
-    mic_wav = tmp_path / "two-track-mic.wav"
-    system_wav = tmp_path / "two-track-system.wav"
+    # Spec 008: ``output_path`` is now a directory; the Swift binary writes
+    # ``mic.wav`` and ``system.wav`` inside it. The Python daemon creates the
+    # directory before sending ``start``; in this test we drive the Swift
+    # binary directly, so the test code is responsible for the mkdir.
+    output_dir = tmp_path / "two-track"
+    output_dir.mkdir(parents=True, exist_ok=False)
+    mic_wav = output_dir / "mic.wav"
+    system_wav = output_dir / "system.wav"
 
     proc = subprocess.Popen(
         [str(capture_binary), "--test-silent-sources"],
@@ -163,7 +168,7 @@ def test_two_track_audio_no_cross_talk(
         # 2. start
         start_cmd = {
             "cmd": "start",
-            "output_path": str(output_basename),
+            "output_path": str(output_dir),
             "format": {
                 "sample_rate": EXPECTED_SAMPLE_RATE,
                 "bit_depth": 16,
@@ -225,7 +230,7 @@ def test_two_track_audio_no_cross_talk(
 
         # ------------------------------------------------------------------
         # Event-stream assertions: exactly two ``audio_file`` events, then
-        # exactly one ``stopped`` whose basename matches what we sent.
+        # exactly one ``stopped`` whose basename matches the session dir.
         # ------------------------------------------------------------------
         audio_file_events = [
             ev for ev in events if ev.get("event") == "audio_file"
@@ -273,9 +278,9 @@ def test_two_track_audio_no_cross_talk(
             )
 
         stopped = stopped_events[0]
-        assert stopped["basename"] == str(output_basename), (
+        assert stopped["basename"] == str(output_dir), (
             f"stopped.basename={stopped['basename']!r} vs "
-            f"expected {str(output_basename)!r}"
+            f"expected {str(output_dir)!r}"
         )
 
         # ------------------------------------------------------------------
@@ -366,9 +371,13 @@ def test_silent_mic_source_reports_silent_throughout(
         exactly zero (the synthetic feeder writes literal zeros; any
         non-zero sample would signal a regression).
     """
-    output_basename = tmp_path / "silent-mic"
-    mic_wav = tmp_path / "silent-mic-mic.wav"
-    system_wav = tmp_path / "silent-mic-system.wav"
+    # Spec 008: ``output_path`` is a session directory; per-source WAVs land
+    # at ``mic.wav`` and ``system.wav`` inside it. Driving Swift directly
+    # means this test creates the directory itself.
+    output_dir = tmp_path / "silent-mic"
+    output_dir.mkdir(parents=True, exist_ok=False)
+    mic_wav = output_dir / "mic.wav"
+    system_wav = output_dir / "system.wav"
 
     proc = subprocess.Popen(
         [str(capture_binary), "--test-silent-sources", "--silent-mic-source"],
@@ -408,7 +417,7 @@ def test_silent_mic_source_reports_silent_throughout(
         # 2. start
         start_cmd = {
             "cmd": "start",
-            "output_path": str(output_basename),
+            "output_path": str(output_dir),
             "format": {
                 "sample_rate": EXPECTED_SAMPLE_RATE,
                 "bit_depth": 16,
@@ -544,9 +553,9 @@ def test_silent_mic_source_reports_silent_throughout(
         )
 
         stopped = stopped_events[0]
-        assert stopped["basename"] == str(output_basename), (
+        assert stopped["basename"] == str(output_dir), (
             f"stopped.basename={stopped['basename']!r} vs "
-            f"expected {str(output_basename)!r}"
+            f"expected {str(output_dir)!r}"
         )
 
         # ------------------------------------------------------------------
@@ -647,9 +656,13 @@ def test_mic_source_lost_truncates_mic_only(
     system_duration_max = 7.0
     frame_tolerance_seconds = 0.1
 
-    output_basename = tmp_path / "trunc"
-    mic_wav = tmp_path / "trunc-mic.wav"
-    system_wav = tmp_path / "trunc-system.wav"
+    # Spec 008: ``output_path`` is the session directory; per-source WAVs land
+    # at ``mic.wav`` / ``system.wav`` inside it. We drive Swift directly, so
+    # this test must create the directory before sending ``start``.
+    output_dir = tmp_path / "trunc"
+    output_dir.mkdir(parents=True, exist_ok=False)
+    mic_wav = output_dir / "mic.wav"
+    system_wav = output_dir / "system.wav"
 
     proc = subprocess.Popen(
         [
@@ -696,7 +709,7 @@ def test_mic_source_lost_truncates_mic_only(
         # 2. start
         start_cmd = {
             "cmd": "start",
-            "output_path": str(output_basename),
+            "output_path": str(output_dir),
             "format": {
                 "sample_rate": EXPECTED_SAMPLE_RATE,
                 "bit_depth": 16,
@@ -870,9 +883,9 @@ def test_mic_source_lost_truncates_mic_only(
         )
 
         stopped = stopped_events[0]
-        assert stopped["basename"] == str(output_basename), (
+        assert stopped["basename"] == str(output_dir), (
             f"stopped.basename={stopped['basename']!r} vs expected "
-            f"{str(output_basename)!r}"
+            f"{str(output_dir)!r}"
         )
 
         # ------------------------------------------------------------------

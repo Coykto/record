@@ -29,7 +29,7 @@ from pathlib import Path
 
 from . import combine as combine_module
 from . import config as config_module
-from . import control, feedback, ipc, launchagent, paths, secrets, state
+from . import control, feedback, ipc, launchagent, naming, paths, secrets, state
 from . import transcribe as transcribe_module
 from .capture import (
     CaptureFailedToStart,
@@ -186,6 +186,11 @@ class Daemon:
     def _default_session_factory(
         self, basename: Path, video_output_path: Path | None
     ) -> CaptureSession:
+        # Spec 008: ``basename`` is now the per-session directory (created by
+        # ``_handle_start`` before this factory runs). The capture-state
+        # sidecar lives alongside the audio/video files inside that folder
+        # rather than at the global ``~/Library/Application Support/record/``
+        # path; persistence semantics are unchanged, only the location moves.
         return CaptureSession(
             basename=basename,
             video_output_path=video_output_path,
@@ -194,6 +199,7 @@ class Daemon:
             channels=_CHANNELS,
             daemon_log_path=self._daemon_log_path,
             owner_pid=os.getpid(),
+            state_file_path=basename / "capture-state.json",
             # Bind every session to the daemon's single shared Swift child.
             # ``self._swift_child`` is set in ``serve_forever`` before any
             # session can be requested (a start request can't arrive until
@@ -305,10 +311,59 @@ class Daemon:
         # Spawn the session outside the lock so a slow Swift start doesn't
         # block status() or a concurrent quit(). The state-machine guarantees
         # nothing else is happening to _session right now.
+        #
+        # Spec 008: each capture lands in its own per-session subfolder named
+        # by the timestamp stem. Python creates the folder up-front and passes
+        # it to Swift as ``output_path``; Swift writes ``mic.wav``/``system.wav``
+        # inside it. The combined WAV, transcript triple, and capture-state
+        # sidecar all live in the same folder.
         stem = _filename_timestamp()
         base = self._output_folder if self._output_folder is not None else Path.cwd()
-        basename = (base / stem).resolve()
-        video_output_path = (base / f"{stem}.mp4").resolve()
+        session_dir = (base / stem).resolve()
+        basename = session_dir  # name retained for diff minimality; semantics moved
+        video_output_path = (session_dir / "video.mp4").resolve()
+
+        try:
+            session_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError as exc:
+            # Same-second collision (two starts in the same wall-clock second).
+            # Treat as a start failure and revert to IDLE so the next attempt
+            # works against a fresh state machine.
+            self._log.warning(
+                "capture_start_failed",
+                error=str(exc),
+                session_dir=str(session_dir),
+                reason="session_folder_already_exists",
+            )
+            async with self._lock:
+                self._state = _CaptureState.IDLE
+                self._session = None
+            return control.ControlResponse(
+                status="error",
+                detail=(
+                    f"capture failed to start: session folder already exists: "
+                    f"{session_dir}"
+                ),
+            )
+        except OSError as exc:
+            # Disk full, permission denied on the output folder, etc. Same
+            # IDLE-revert dance.
+            self._log.warning(
+                "capture_start_failed",
+                error=str(exc),
+                session_dir=str(session_dir),
+                reason="session_folder_mkdir_failed",
+            )
+            async with self._lock:
+                self._state = _CaptureState.IDLE
+                self._session = None
+            return control.ControlResponse(
+                status="error",
+                detail=(
+                    f"capture failed to start: could not create session folder "
+                    f"{session_dir}: {exc}"
+                ),
+            )
 
         session = self._session_factory(basename, video_output_path)
 
@@ -353,11 +408,12 @@ class Daemon:
         # (hotkey or socket-driven ``record start``).
         self._safe_play_start()
 
-        # Spec 005: capture now produces two WAVs derived from the basename.
-        # Surface both via ``audio_paths`` and keep ``audio_path`` populated
-        # with the mic file for the existing single-field CLI surface.
-        mic_path = str(basename) + "-mic.wav"
-        system_path = str(basename) + "-system.wav"
+        # Spec 005 + 008: capture produces two WAVs inside the per-session
+        # folder. Surface both via ``audio_paths`` and keep ``audio_path``
+        # populated with the mic file for the existing single-field CLI
+        # surface.
+        mic_path = str(session_dir / "mic.wav")
+        system_path = str(session_dir / "system.wav")
         return control.ControlResponse(
             status="ok",
             capture_id=stem,
@@ -662,7 +718,10 @@ class Daemon:
             )
             return
         basename = Path(basename_str)
-        combined_path = basename.parent / f"{basename.name}.wav"
+        # Spec 008: ``basename`` is now the per-session directory rather than
+        # a flat-folder stem; the combined WAV lives inside it under the
+        # role-only name ``combined.wav``.
+        combined_path = basename / "combined.wav"
 
         files = final.get("audio_files") or {}
         mic_entry = files.get("mic") if isinstance(files, dict) else None
@@ -938,12 +997,17 @@ class Daemon:
         stem = audio_path.stem
 
         async def _run() -> None:
-            # ``stem_path`` is the .wav with its suffix dropped; the writers
-            # append .json/.txt/.srt per their contract.
-            stem_path = audio_path.with_suffix("")
+            # Spec 008: transcript files live alongside the combined WAV in
+            # the per-session folder, named ``transcript.{json,txt,srt}``.
+            # The writers append .json/.txt/.srt per their contract.
+            stem_path = audio_path.parent / "transcript"
             try:
                 transcript = await backend.transcribe(audio_path)
                 transcribe_module.write_transcript(transcript, stem_path)
+                await naming.try_rename_session_folder(
+                    session_dir=audio_path.parent,
+                    transcript=transcript,
+                )
             except transcribe_module.TranscriptionError as exc:
                 self._log.error(
                     "transcription_failed",

@@ -1,6 +1,6 @@
 # record
 
-A privacy-first macOS meeting recorder. A background daemon runs while you're logged in, listening for a single global hotkey. Press it to start a capture; press it again to stop. Each capture records your microphone and the system audio output on the same machine as two independent `.wav` files (`-mic.wav` and `-system.wav`), plus a primary-display `.mp4` (all sharing one timestamp stem) to a predictable folder. There is no recording bot, no cloud upload, no calendar integration — it's for someone who wants a faithful local copy of every client call without having a third party in the meeting. This is an early Phase 1 build.
+A privacy-first macOS meeting recorder. A background daemon runs while you're logged in, listening for a single global hotkey. Press it to start a capture; press it again to stop. Each capture records your microphone and the system audio output on the same machine as two independent `.wav` files (`mic.wav` and `system.wav`), plus a primary-display `video.mp4`, into a per-session folder under a predictable root. There is no recording bot, no cloud upload, no calendar integration — it's for someone who wants a faithful local copy of every client call without having a third party in the meeting. This is an early Phase 1 build.
 
 ## Quickstart
 
@@ -13,7 +13,7 @@ record install    # register the daemon to autostart on login, and start it now
 
 - Press **⌥⌘R** (Option + Command + R) to start a capture — you'll hear a short "Submarine" ping.
 - Press **⌥⌘R** again to stop — you'll hear a short "Pop".
-- Recordings land in `~/record/` as a paired set: `<timestamp>-mic.wav`, `<timestamp>-system.wav`, and `<timestamp>.mp4`.
+- Recordings land in a per-session subfolder under `~/record/`: `~/record/<timestamp>/mic.wav`, `system.wav`, `combined.wav`, `video.mp4`, and `transcript.{json,txt,srt}`. After transcription, the folder is best-effort renamed to `~/record/<timestamp>-<short-description>/` (or `~/record/<timestamp>-silent/` if nothing was said).
 
 The daemon has no menu bar icon, no Dock icon, and no window. To remove it:
 
@@ -25,13 +25,17 @@ record uninstall  # bootout the LaunchAgent, stop the daemon
 
 ## Output
 
-Each capture (hotkey press to hotkey press, or `record start` to `record stop`) produces, in the configured `output_folder` (default `~/record/`):
+Each capture (hotkey press to hotkey press, or `record start` to `record stop`) produces a per-session subfolder `<output_folder>/<ISO-8601-timestamp>/` (default `<output_folder>` is `~/record/`) containing:
 
-- `{ISO-8601-timestamp}-mic.wav` — microphone audio only (mono, 16 kHz, 16-bit PCM).
-- `{ISO-8601-timestamp}-system.wav` — system audio output only (mono, 16 kHz, 16-bit PCM).
-- `{ISO-8601-timestamp}.mp4` — primary display at native resolution, 30 fps, cursor visible, no audio track.
+- `mic.wav` — microphone audio only (mono, 16 kHz, 16-bit PCM).
+- `system.wav` — system audio output only (mono, 16 kHz, 16-bit PCM).
+- `combined.wav` — the two tracks mixed for transcription.
+- `video.mp4` — primary display at native resolution, 30 fps, cursor visible, no audio track.
+- `transcript.json`, `transcript.txt`, `transcript.srt` — transcription output.
 
-The two `.wav` files are written independently — no mixing, so the mic track contains only your voice and the system track contains only what the meeting app played. The `output_folder` is created automatically on first use. Daemon-driven captures do **not** land in the current working directory — that placeholder behavior from the pre-daemon build is gone.
+The two source `.wav` files are written independently — no mixing into `mic.wav` / `system.wav`, so the mic track contains only your voice and the system track contains only what the meeting app played. The `output_folder` is created automatically on first use. Daemon-driven captures do **not** land in the current working directory — that placeholder behavior from the pre-daemon build is gone.
+
+After transcription completes, the session folder is best-effort renamed to `<output_folder>/<timestamp>-<short-description>/` (a kebab-case English summary of what was discussed), or to `<output_folder>/<timestamp>-silent/` if no one spoke. If renaming fails for any reason, the folder stays at `<output_folder>/<timestamp>/` and all files inside are untouched.
 
 Audio is always-on; video is best-effort. Any video failure (permission denied, SCStream error, writer failure) leaves audio capture untouched — the two `.wav` files are still produced, and the `.mp4` is either omitted (if video never started) or finalized with whatever was captured. The `record stop` summary describes the outcome.
 
@@ -50,6 +54,8 @@ make install
 
 That builds the Swift `record-capture` binary into `src/record/bin/` (release config), then runs `uv pip install -e .`. After install, the `record` command is on your `$PATH`. Run `record install` (see Quickstart) to register and start the daemon.
 
+The orchestrator shells out to `claude -p` after each capture to auto-name session folders. If the `claude` CLI is not on `PATH`, session folders remain at their timestamp-only name and nothing else is affected.
+
 ## Permissions
 
 The daemon and capture pipeline need three macOS TCC permissions:
@@ -60,7 +66,7 @@ The daemon and capture pipeline need three macOS TCC permissions:
 
 `record install` primes the Microphone and Screen Recording prompts from the terminal, because a launchd-spawned daemon cannot present those prompts itself. The Accessibility prompt appears when the daemon registers the hotkey.
 
-If you deny **Microphone**, a capture cannot start (exit code `2` from `record start`). If you deny **Screen Recording**, mic capture still proceeds (the `-mic.wav` is produced) but the `-system.wav` is empty/silent and no `.mp4` is produced; the stop summary reports `video: unavailable — permission_denied`. If you deny **Accessibility**, the daemon keeps running and the terminal `record start` / `record stop` commands still work — only the hotkey is disabled. `record status` reports `hotkey: disabled — Accessibility permission missing`.
+If you deny **Microphone**, a capture cannot start (exit code `2` from `record start`). If you deny **Screen Recording**, mic capture still proceeds (`mic.wav` is produced) but `system.wav` is empty/silent and no `video.mp4` is produced; the stop summary reports `video: unavailable — permission_denied`. If you deny **Accessibility**, the daemon keeps running and the terminal `record start` / `record stop` commands still work — only the hotkey is disabled. `record status` reports `hotkey: disabled — Accessibility permission missing`.
 
 To grant or re-grant later:
 
@@ -107,7 +113,7 @@ The daemon reads an optional TOML file at `~/.config/record/config.toml`. If the
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `hotkey` | string | `option+command+r` | The start/stop shortcut. One or more modifiers (`cmd`/`command`, `opt`/`option`/`alt`, `ctrl`/`control`, `shift`) plus a single key (`a-z`, `0-9`, `f1-f20`, or `space`/`tab`/`return`/`escape`/`delete`). An invalid value logs a warning and falls back to the default — the daemon never refuses to start. |
-| `output_folder` | path | `~/record/` | Absolute folder where the two `.wav` files (`-mic.wav` and `-system.wav`) and the `.mp4` are written. Auto-created on first capture. |
+| `output_folder` | path | `~/record/` | Absolute root folder under which each capture creates a per-session subfolder (`<timestamp>/`, later renamed) holding `mic.wav`, `system.wav`, `combined.wav`, `video.mp4`, and `transcript.{json,txt,srt}`. Auto-created on first capture. |
 | `log_folder` | path | `~/record/logs/` | Absolute folder for the daemon log. Auto-created on daemon start. Independent of `output_folder`. |
 | `audible_feedback` | bool | `true` | Whether the start/stop/error sounds play. When off, error conditions still surface via a macOS notification banner. |
 
@@ -125,7 +131,7 @@ audible_feedback = false
 
 The recording itself behaves exactly as it did in the pre-daemon build:
 
-- Two independent `.wav` files (`-mic.wav` and `-system.wav`) plus a primary-display `.mp4`, all sharing one timestamp stem.
+- Two independent `.wav` files (`mic.wav` and `system.wav`) plus a primary-display `video.mp4`, all written into the same per-session folder.
 - Audio required, video best-effort (see Output above).
 - Closing the laptop lid, locking the screen (⌃⌘Q), or letting the display sleep ends the capture cleanly — all files are finalized and saved. There is **no auto-resume** on wake / unlock; start a new capture if you want to keep recording. The daemon writes a one-line system-event summary into `daemon.log`.
 - The hotkey is intercepted by macOS before any meeting client sees it — no extra participant, no "recording" banner, the keypress is not delivered to Zoom / Meet / Teams.
@@ -134,7 +140,7 @@ The recording itself behaves exactly as it did in the pre-daemon build:
 
 Each scenario starts from a clean state — `record uninstall` then `record install`.
 
-1. **Hotkey happy path.** Press ⌥⌘R from a focused Chrome tab in a Google Meet session → Submarine sound. Speak for ~30 s. Press ⌥⌘R again → Pop sound. Verify all three files in `~/record/` (`-mic.wav`, `-system.wav`, `.mp4`) play back; the mic file contains your voice, the system file contains the meeting audio, and the video shows the primary display.
+1. **Hotkey happy path.** Press ⌥⌘R from a focused Chrome tab in a Google Meet session → Submarine sound. Speak for ~30 s. Press ⌥⌘R again → Pop sound. Verify the per-session folder under `~/record/` contains `mic.wav`, `system.wav`, and `video.mp4` that play back; the mic file contains your voice, the system file contains the meeting audio, and the video shows the primary display.
 2. **Terminal-CLI parity.** `record start` from a terminal → press the hotkey to stop. All files finalize via the same daemon path. Confirm `record status` between phases shows the correct state.
 3. **Hotkey conflict.** Bind ⌥⌘R in another app (e.g. a Keyboard Maestro macro) → `record daemon restart` → press the hotkey → the other app fires, not `record`. `record status` reports the hotkey may be inactive. Unbind in the other app → `record daemon restart` → the hotkey works again.
 4. **Accessibility denied.** Revoke Accessibility for the daemon's binary in System Settings → `record daemon restart`. The daemon runs, no hotkey, a notification banner names Accessibility. `record start` from the terminal still works.

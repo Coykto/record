@@ -89,8 +89,10 @@ private final class LockedQueue {
 /// closes only its writer; the other continues until `stop()` runs.
 final class AudioCapture: NSObject {
 
-    /// Output basename (no extension). The two writers' file URLs are
-    /// derived by appending `-mic.wav` and `-system.wav` to this path.
+    /// Output directory. The two writers' file URLs are derived by appending
+    /// `mic.wav` and `system.wav` inside this directory. The orchestrator
+    /// creates the directory before sending `start`; this class does not
+    /// create it.
     private let basename: URL
     private let emit: (Event) -> Void
     /// Shared int16 / mono / 16 kHz interleaved processing format. Both writers
@@ -290,11 +292,10 @@ final class AudioCapture: NSObject {
         self.testSilentSources = testSilentSources
         self.injectMicLossAfterSeconds = injectMicLossAfterSeconds
         self.silentMicSource = silentMicSource
-        // Append the per-source suffix to the basename's path. We can't use
-        // `URL.appendingPathExtension` because the basename has no extension
-        // *and* we want to add a literal `-mic`/`-system` infix before `.wav`.
-        let micURL = URL(fileURLWithPath: basename.path + "-mic.wav")
-        let systemURL = URL(fileURLWithPath: basename.path + "-system.wav")
+        // `basename` is a directory the orchestrator created before sending
+        // `start`. Per-source WAVs live inside it under role-only names.
+        let micURL = basename.appendingPathComponent("mic.wav")
+        let systemURL = basename.appendingPathComponent("system.wav")
         self.micURL = micURL
         self.systemURL = systemURL
         let micWriter = try WAVWriter(url: micURL)

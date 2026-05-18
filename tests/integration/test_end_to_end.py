@@ -57,11 +57,14 @@ EXPECTED_SAMPWIDTH_BYTES = 2  # 16-bit signed PCM
 def test_end_to_end_silent_sources(
     capture_binary: Path, tmp_path: Path
 ) -> None:
-    # Spec 005: ``output_path`` is now an absolute basename without extension.
-    # The Swift binary derives ``-mic.wav`` and ``-system.wav`` from it.
-    output_basename = tmp_path / "synthetic"
-    mic_wav = tmp_path / "synthetic-mic.wav"
-    system_wav = tmp_path / "synthetic-system.wav"
+    # Spec 008: ``output_path`` is now the session directory. The Swift binary
+    # writes ``mic.wav`` and ``system.wav`` inside it. Python's daemon creates
+    # the directory before sending ``start``; this test drives Swift directly
+    # so it has to mkdir the session dir itself.
+    output_dir = tmp_path / "synthetic"
+    output_dir.mkdir(parents=True, exist_ok=False)
+    mic_wav = output_dir / "mic.wav"
+    system_wav = output_dir / "system.wav"
 
     proc = subprocess.Popen(
         [str(capture_binary), "--test-silent-sources"],
@@ -108,7 +111,7 @@ def test_end_to_end_silent_sources(
         # 2. Send ``start`` with the format the real orchestrator negotiates.
         start_cmd = {
             "cmd": "start",
-            "output_path": str(output_basename),
+            "output_path": str(output_dir),
             "format": {
                 "sample_rate": EXPECTED_SAMPLE_RATE,
                 "bit_depth": 16,
@@ -218,9 +221,9 @@ def test_end_to_end_silent_sources(
         # ``stopped`` payload sanity.
         # ------------------------------------------------------------------
         stopped = events[-1]
-        assert stopped["basename"] == str(output_basename), (
+        assert stopped["basename"] == str(output_dir), (
             f"stopped.basename mismatch: {stopped['basename']!r} "
-            f"vs {str(output_basename)!r}"
+            f"vs {str(output_dir)!r}"
         )
 
         # Spec 005: exactly two ``audio_file`` events, one per source, must
@@ -492,14 +495,18 @@ def test_end_to_end_silent_sources_with_synthetic_video(
     so long as the partial-order invariants hold), the WAV format + duration,
     and the MP4 dimensions + duration + filename-stem pairing.
     """
-    # Shared timestamp stem mirrors the supervisor's CWD-and-stem convention.
-    # Spec 005: ``output_path`` is the basename without extension; the Swift
-    # binary derives the two per-source WAVs.
+    # Spec 008: ``output_path`` is the session directory. Swift writes
+    # ``mic.wav`` / ``system.wav`` inside it; the orchestrator places the
+    # ``video.mp4`` next to them (``video_output_path`` is an absolute path,
+    # not derived from ``output_path``). The directory name doubles as the
+    # session stem — keeping the timestamp-style name preserves the original
+    # supervisor-CWD intent.
     stem = "2026-05-12T00-00-00"
-    output_basename = tmp_path / stem
-    mic_wav = tmp_path / f"{stem}-mic.wav"
-    system_wav = tmp_path / f"{stem}-system.wav"
-    output_mp4 = tmp_path / f"{stem}.mp4"
+    output_dir = tmp_path / stem
+    output_dir.mkdir(parents=True, exist_ok=False)
+    mic_wav = output_dir / "mic.wav"
+    system_wav = output_dir / "system.wav"
+    output_mp4 = output_dir / "video.mp4"
 
     proc = subprocess.Popen(
         [
@@ -543,7 +550,7 @@ def test_end_to_end_silent_sources_with_synthetic_video(
 
         start_cmd = {
             "cmd": "start",
-            "output_path": str(output_basename),
+            "output_path": str(output_dir),
             "video_output_path": str(output_mp4),
             "format": {
                 "sample_rate": EXPECTED_SAMPLE_RATE,
@@ -692,7 +699,7 @@ def test_end_to_end_silent_sources_with_synthetic_video(
         )
 
         stopped = events[-1]
-        assert stopped["basename"] == str(output_basename)
+        assert stopped["basename"] == str(output_dir)
 
         # Spec 005: exactly two ``audio_file`` events accompany ``stopped``.
         audio_file_events = [
@@ -704,14 +711,21 @@ def test_end_to_end_silent_sources_with_synthetic_video(
         )
 
         # ------------------------------------------------------------------
-        # File-pairing assertion (slice 2 acceptance criterion) — spec 005:
-        # both per-source WAVs land alongside the MP4 with the shared stem.
+        # File-pairing assertion (slice 2 acceptance criterion) — spec 008:
+        # all three artifacts land inside the session directory under their
+        # role-only filenames (``mic.wav`` / ``system.wav`` / ``video.mp4``).
         # ------------------------------------------------------------------
         assert mic_wav.exists(), f"mic WAV not written to {mic_wav}"
         assert system_wav.exists(), f"system WAV not written to {system_wav}"
         assert output_mp4.exists(), f"MP4 not written to {output_mp4}"
-        assert mic_wav.name.startswith(stem), (
-            f"mic wav name {mic_wav.name!r} does not start with stem {stem!r}"
+        assert mic_wav.parent == output_dir, (
+            f"mic wav landed outside session dir: {mic_wav!r}"
+        )
+        assert system_wav.parent == output_dir, (
+            f"system wav landed outside session dir: {system_wav!r}"
+        )
+        assert output_mp4.parent == output_dir, (
+            f"mp4 landed outside session dir: {output_mp4!r}"
         )
 
         # ------------------------------------------------------------------
@@ -878,9 +892,10 @@ def test_end_to_end_daemon_driven_start_stop(
     socket_path = (
         sandbox / "Library" / "Application Support" / "record" / "daemon.sock"
     )
-    state_path = (
-        sandbox / "Library" / "Application Support" / "record" / "capture-state.json"
-    )
+    # Spec 008: capture-state.json now lives inside the per-session folder,
+    # not at the global ``~/Library/Application Support/record/`` path. The
+    # session dir is only known after ``start`` returns, so the test resolves
+    # ``state_path`` from the paths in the start response.
 
     try:
         # Wait for the daemon to bind its socket.
@@ -900,13 +915,18 @@ def test_end_to_end_daemon_driven_start_stop(
         assert start_resp["status"] == "ok", start_resp
         # Spec 005: ``audio_path`` carries the mic file (single-field surface);
         # ``audio_paths`` carries both per-source paths.
+        # Spec 008: all session artifacts live in a per-session directory
+        # under the configured output folder; the three files share one parent.
         audio_path = Path(start_resp["audio_path"])
         audio_paths = start_resp.get("audio_paths") or {}
         system_audio_path = Path(audio_paths["system_audio"])
         video_path = Path(start_resp["video_path"])
-        assert audio_path.parent == cwd_resolved, audio_path
-        assert system_audio_path.parent == cwd_resolved, system_audio_path
-        assert video_path.parent == cwd_resolved, video_path
+        session_dir = audio_path.parent
+        assert session_dir.parent == cwd_resolved, session_dir
+        assert system_audio_path.parent == session_dir, system_audio_path
+        assert video_path.parent == session_dir, video_path
+        # Spec 008: capture-state.json lives inside the session folder.
+        state_path = session_dir / "capture-state.json"
 
         # Let the synthetic capture run briefly so it produces real frames.
         time.sleep(2.0)
@@ -939,12 +959,10 @@ def test_end_to_end_daemon_driven_start_stop(
         assert files.get("mic", {}).get("path") == str(audio_path)
         assert files.get("system_audio", {}).get("path") == str(system_audio_path)
 
-        # Spec 007: daemon produces a combined WAV next to the source files,
-        # named ``<timestamp>.wav`` (the mic stem with the ``-mic`` suffix
-        # stripped). It surfaces in ``capture-state.json`` under
-        # ``combined_audio``.
-        combined_stem = audio_path.stem.removesuffix("-mic")
-        combined_path = audio_path.parent / f"{combined_stem}.wav"
+        # Spec 008: daemon produces a combined WAV inside the session
+        # directory under the fixed role-only name ``combined.wav``. It
+        # surfaces in ``capture-state.json`` under ``combined_audio``.
+        combined_path = audio_path.parent / "combined.wav"
         assert combined_path.exists(), (
             f"combined audio file missing at {combined_path}"
         )
@@ -1193,10 +1211,14 @@ def test_end_to_end_daemon_auto_transcription_on_finalize(
                 assert start_resp["status"] == "ok", start_resp
                 # Spec 005: ``audio_path`` is the mic file; ``audio_paths`` is
                 # the per-source map.
+                # Spec 008: ``audio_path``'s parent is the per-session dir,
+                # which itself lives under the configured output folder.
                 audio_path = Path(start_resp["audio_path"])
                 audio_paths = start_resp.get("audio_paths") or {}
                 system_audio_path = Path(audio_paths["system_audio"])
-                assert audio_path.parent == cwd_resolved, audio_path
+                session_dir = audio_path.parent
+                assert session_dir.parent == cwd_resolved, session_dir
+                assert system_audio_path.parent == session_dir, system_audio_path
 
                 # Let the synthetic capture produce a beat of real frames.
                 time.sleep(1.5)
@@ -1209,11 +1231,11 @@ def test_end_to_end_daemon_auto_transcription_on_finalize(
                 assert audio_path.exists()
                 assert system_audio_path.exists()
 
-                # Spec 007: the daemon now produces a combined WAV next to the
-                # per-source files and transcribes that combined file only.
+                # Spec 008: the daemon places the combined WAV inside the
+                # session directory under the role-only name ``combined.wav``
+                # and transcribes that combined file only.
                 stem_dir = audio_path.parent
-                combined_stem = audio_path.stem.removesuffix("-mic")
-                combined_path = stem_dir / f"{combined_stem}.wav"
+                combined_path = stem_dir / "combined.wav"
                 assert combined_path.exists(), (
                     f"combined audio file missing at {combined_path}"
                 )
@@ -1237,12 +1259,13 @@ def test_end_to_end_daemon_auto_transcription_on_finalize(
                 )
 
                 # ----- wait for the spawned transcription task -----------
-                # Spec 007: exactly one transcript triple per session, derived
-                # from the combined WAV.
+                # Spec 008: exactly one transcript triple per session, derived
+                # from the combined WAV, written under the role-only stem
+                # ``transcript.{json,txt,srt}`` inside the session directory.
                 expected_files: list[Path] = [
-                    stem_dir / f"{combined_stem}.json",
-                    stem_dir / f"{combined_stem}.txt",
-                    stem_dir / f"{combined_stem}.srt",
+                    stem_dir / "transcript.json",
+                    stem_dir / "transcript.txt",
+                    stem_dir / "transcript.srt",
                 ]
 
                 got_all = _wait_for_files(expected_files, timeout=10.0)
@@ -1263,7 +1286,7 @@ def test_end_to_end_daemon_auto_transcription_on_finalize(
 
                 # Sanity-check the combined .json content. The stub's canned
                 # utterance carries "hello there" as the lone segment's text.
-                json_path = stem_dir / f"{combined_stem}.json"
+                json_path = stem_dir / "transcript.json"
                 payload = json.loads(json_path.read_text(encoding="utf-8"))
                 assert payload["provider"] == "deepgram"
                 assert payload["model"] == "nova-3"
@@ -1376,9 +1399,8 @@ def test_end_to_end_daemon_driven_three_cycles(
     socket_path = (
         sandbox / "Library" / "Application Support" / "record" / "daemon.sock"
     )
-    state_path = (
-        sandbox / "Library" / "Application Support" / "record" / "capture-state.json"
-    )
+    # Spec 008: capture-state.json is per-session and lives inside each cycle's
+    # session directory; the path is derived from the start-response below.
 
     # Per-cycle capture window. Stays short on purpose: total wall-clock
     # budget for the test is ~6 s (1.5 s × 3 + Swift bring-up + finalize).
@@ -1416,13 +1438,18 @@ def test_end_to_end_daemon_driven_three_cycles(
             )
             # Spec 005: ``audio_path`` is the mic file; ``audio_paths`` carries
             # both per-source paths.
+            # Spec 008: per-cycle artifacts live in a fresh session dir under
+            # the configured output folder; all three files share that parent.
             audio_path = Path(start_resp["audio_path"])
             audio_paths = start_resp.get("audio_paths") or {}
             system_audio_path = Path(audio_paths["system_audio"])
             video_path = Path(start_resp["video_path"])
-            assert audio_path.parent == cwd_resolved, audio_path
-            assert system_audio_path.parent == cwd_resolved, system_audio_path
-            assert video_path.parent == cwd_resolved, video_path
+            session_dir = audio_path.parent
+            assert session_dir.parent == cwd_resolved, session_dir
+            assert system_audio_path.parent == session_dir, system_audio_path
+            assert video_path.parent == session_dir, video_path
+            # Spec 008: capture-state.json lives in the per-cycle session dir.
+            state_path = session_dir / "capture-state.json"
 
             # Let the synthetic feed produce real frames for a beat.
             time.sleep(cycle_window_seconds)
@@ -1466,10 +1493,10 @@ def test_end_to_end_daemon_driven_three_cycles(
                 f"mismatch: {final_state!r}"
             )
 
-            # Spec 007: combined WAV lands alongside the per-source files
-            # and is reflected in ``capture-state.json``.
-            combined_stem = audio_path.stem.removesuffix("-mic")
-            combined_path = audio_path.parent / f"{combined_stem}.wav"
+            # Spec 008: combined WAV lands inside the per-session directory
+            # under the role-only name ``combined.wav`` and is reflected in
+            # ``capture-state.json``.
+            combined_path = audio_path.parent / "combined.wav"
             assert combined_path.exists(), (
                 f"cycle {cycle_idx}: combined audio file missing at "
                 f"{combined_path}"
@@ -1511,20 +1538,21 @@ def test_end_to_end_daemon_driven_three_cycles(
             # cycles because no transient asyncio pipes are open.
             fds_after_cycle.append(daemon_psutil.num_fds())
 
-        # All three pairs of files survive on disk and use distinct stems.
-        # Spec 005: the mic file's name is ``<timestamp>-mic.wav`` so its stem
-        # is ``<timestamp>-mic`` — strip the ``-mic`` suffix to compare against
-        # the video file's bare timestamp stem.
+        # All three pairs of files survive on disk and live under distinct
+        # session directories. Spec 008: per-source files are role-only
+        # (``mic.wav`` / ``video.mp4``) so the per-cycle identity lives in the
+        # parent directory, not the filename stem.
         all_audio_paths = [p[0] for p in cycle_paths]
         all_video_paths = [p[1] for p in cycle_paths]
-        all_stems = {p.stem for p in all_audio_paths}
-        assert len(all_stems) == 3, (
-            f"expected 3 distinct filename stems, got {sorted(all_stems)!r}"
+        all_session_dirs = {p.parent for p in all_audio_paths}
+        assert len(all_session_dirs) == 3, (
+            f"expected 3 distinct session directories, got "
+            f"{sorted(str(d) for d in all_session_dirs)!r}"
         )
-        combined_stems = {p.stem for p in combined_paths}
-        assert len(combined_stems) == 3, (
-            f"expected 3 distinct combined-WAV stems, got "
-            f"{sorted(combined_stems)!r}"
+        combined_session_dirs = {p.parent for p in combined_paths}
+        assert len(combined_session_dirs) == 3, (
+            f"expected 3 distinct combined-WAV session dirs, got "
+            f"{sorted(str(d) for d in combined_session_dirs)!r}"
         )
         for audio_path, video_path in cycle_paths:
             assert audio_path.exists(), (
@@ -1533,9 +1561,9 @@ def test_end_to_end_daemon_driven_three_cycles(
             assert video_path.exists(), (
                 f"video path {video_path} disappeared between cycles"
             )
-            assert audio_path.stem.removesuffix("-mic") == video_path.stem, (
-                f"per-cycle wav/mp4 stems do not match: "
-                f"{audio_path.stem!r} vs {video_path.stem!r}"
+            assert audio_path.parent == video_path.parent, (
+                f"per-cycle wav/mp4 not co-located in session dir: "
+                f"{audio_path!r} vs {video_path!r}"
             )
 
         # fd-stability gate. The headline contract: cycle-3 fd count must not

@@ -62,10 +62,11 @@ enum HotkeyRegistrationStatus: String, Codable, Equatable {
 enum Command: Equatable {
     /// Begin a capture.
     ///
-    /// - `outputPath`: absolute path basename without extension; the daemon
-    ///   appends `-mic.wav` and `-system.wav` to derive the two audio file
-    ///   paths. The JSON wire key is `output_path` (unchanged from spec 001)
-    ///   but its semantics are now "basename", not "full path".
+    /// - `outputPath`: absolute path to a directory the orchestrator created
+    ///   before sending `start`; the daemon writes `mic.wav` and `system.wav`
+    ///   inside it. The JSON wire key is `output_path` (unchanged from spec
+    ///   001) but its semantics are now "directory", not "basename" or
+    ///   "full path".
     case start(outputPath: String, videoOutputPath: String?, format: AudioFormat, video: VideoConfig?)
     case stop
     case shutdown

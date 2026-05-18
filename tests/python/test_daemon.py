@@ -13,6 +13,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -264,11 +265,12 @@ class _FakeSession:
         self.start_calls = 0
         self.stop_calls = 0
         self.stopped_event = asyncio.Event()
-        # Mirror the shape ``capture._initial_state`` produces (spec 005:
-        # per-source ``audio_files`` map under a basename) so ``_handle_stop``
-        # / ``_handle_status`` can read it identically to the real session.
-        mic_path = str(basename) + "-mic.wav"
-        system_path = str(basename) + "-system.wav"
+        # Spec 008: ``basename`` is the per-session directory; mic/system live
+        # inside it under role-only names. Mirror the shape ``capture._initial_state``
+        # produces so ``_handle_stop`` / ``_handle_status`` can read it identically
+        # to the real session.
+        mic_path = str(basename / "mic.wav")
+        system_path = str(basename / "system.wav")
         self._state: dict[str, object] = {
             "basename": str(basename),
             "video_output_path": (
@@ -1129,6 +1131,7 @@ def _patch_transcription(
     *,
     api_key: str | None = "test-key",
     backends: list[_StubBackend] | None = None,
+    patch_rename: bool = True,
 ) -> list[_StubBackend]:
     """Patch the daemon's secret lookup + backend constructor.
 
@@ -1136,6 +1139,16 @@ def _patch_transcription(
     assert on the backends the daemon constructed. When ``backends`` is
     pre-seeded, the factory pops from it (FIFO); otherwise it appends fresh
     successful stubs.
+
+    Spec 008 slice 3: by default also patches
+    ``record.daemon.naming.try_rename_session_folder`` to a no-op
+    ``AsyncMock``. The real implementation shells out to ``claude -p`` to
+    generate a kebab-case suffix for the session folder; without the patch,
+    every test that drains the detached transcription task would spawn a real
+    subprocess. Tests that specifically need to assert on the rename hook
+    (slice 2: ``test_stop_invokes_rename_after_transcription``,
+    ``test_stop_swallows_rename_exception``) re-patch it locally with their
+    own mock — the local ``monkeypatch.setattr`` simply replaces the no-op.
     """
     seeded: list[_StubBackend] = list(backends) if backends else []
     handed_out: list[_StubBackend] = []
@@ -1159,7 +1172,30 @@ def _patch_transcription(
     monkeypatch.setattr(
         daemon.transcribe_module, "DeepgramBackend", _factory
     )
+
+    if patch_rename:
+        monkeypatch.setattr(
+            "record.daemon.naming.try_rename_session_folder",
+            AsyncMock(return_value=None),
+        )
     return handed_out
+
+
+def _install_unique_timestamps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch :func:`daemon._filename_timestamp` to return a fresh stem per call.
+
+    Spec 008: each capture lands in its own ``<output_folder>/<stem>/`` folder
+    that the daemon creates with ``exist_ok=False``. Tests doing two starts in
+    quick succession would otherwise collide on the wall-clock second; this
+    helper hands out monotonically-numbered stems so each ``mkdir`` succeeds.
+    """
+    counter = {"n": 0}
+
+    def _fake_stamp() -> str:
+        counter["n"] += 1
+        return f"2026-05-16T00-00-{counter['n']:02d}"
+
+    monkeypatch.setattr(daemon, "_filename_timestamp", _fake_stamp)
 
 
 async def _drain_background(d: daemon.Daemon, timeout: float = 2.0) -> None:
@@ -1214,24 +1250,25 @@ def test_stop_spawns_one_transcription_task_and_writes_files(
     assert len(handed_out) == 1
     assert len(handed_out[0].calls) == 1
 
-    basename = session_holder[0].basename
-    mic_path = Path(str(basename) + "-mic.wav")
-    system_path = Path(str(basename) + "-system.wav")
-    combined_path = Path(str(basename) + ".wav")
+    # Spec 008: ``basename`` is the per-session directory; the source WAVs,
+    # combined WAV, and transcript triple all live inside it.
+    session_dir = session_holder[0].basename
+    mic_path = session_dir / "mic.wav"
+    system_path = session_dir / "system.wav"
+    combined_path = session_dir / "combined.wav"
     assert handed_out[0].calls[0] == combined_path
 
-    # Combined-file transcript triple appears.
-    base = combined_path.stem
-    stem_dir = combined_path.parent
-    assert (stem_dir / f"{base}.json").is_file()
-    assert (stem_dir / f"{base}.txt").is_file()
-    assert (stem_dir / f"{base}.srt").is_file()
+    # Combined-file transcript triple appears as ``transcript.{json,txt,srt}``
+    # next to the combined WAV (spec 008 layout).
+    assert (session_dir / "transcript.json").is_file()
+    assert (session_dir / "transcript.txt").is_file()
+    assert (session_dir / "transcript.srt").is_file()
     # Per-source transcripts must NOT appear.
     for source_path in (mic_path, system_path):
         s_base = source_path.stem
-        assert not (stem_dir / f"{s_base}.json").exists()
-        assert not (stem_dir / f"{s_base}.txt").exists()
-        assert not (stem_dir / f"{s_base}.srt").exists()
+        assert not (session_dir / f"{s_base}.json").exists()
+        assert not (session_dir / f"{s_base}.txt").exists()
+        assert not (session_dir / f"{s_base}.srt").exists()
 
     # ControlResponse round-trip: ``audio_paths`` still carries both source
     # files, ``audio_path`` still keeps the mic file as the single-field
@@ -1241,6 +1278,105 @@ def test_stop_spawns_one_transcription_task_and_writes_files(
         "system_audio": str(system_path),
     }
     assert resp.audio_path == str(mic_path)
+
+
+def test_stop_invokes_rename_after_transcription(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec 008 slice 2: successful transcription triggers naming hook."""
+    handed_out = _patch_transcription(monkeypatch)
+    state_path = daemon_paths["root"] / "capture-state.json"
+    monkeypatch.setattr(state, "_default_state_file", lambda: state_path)
+
+    rename_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        "record.daemon.naming.try_rename_session_folder", rename_mock
+    )
+
+    session_holder: list[_CombineFakeSession] = []
+
+    def _factory(
+        basename: Path, video_output_path: Path | None
+    ) -> _CombineFakeSession:
+        s = _CombineFakeSession(
+            basename=basename, video_output_path=video_output_path
+        )
+        session_holder.append(s)
+        return s
+
+    d = daemon.Daemon(
+        daemon_log_path=daemon_paths["log"],
+        session_factory=_factory,
+        output_folder=daemon_paths["root"],
+    )
+
+    async def _drive() -> control.ControlResponse:
+        await d.handle_request(control.StartRequest())
+        resp = await d.handle_request(control.StopRequest())
+        await _drain_background(d)
+        return resp
+
+    resp = asyncio.run(_drive())
+    assert resp.status == "ok"
+
+    session_dir = session_holder[0].basename
+    expected_transcript = handed_out[0]._transcript
+
+    assert rename_mock.await_count == 1
+    rename_mock.assert_awaited_once_with(
+        session_dir=session_dir, transcript=expected_transcript
+    )
+
+
+def test_stop_swallows_rename_exception(
+    daemon_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A naming-hook exception is caught — daemon returns to IDLE cleanly."""
+    _patch_transcription(monkeypatch)
+    state_path = daemon_paths["root"] / "capture-state.json"
+    monkeypatch.setattr(state, "_default_state_file", lambda: state_path)
+
+    rename_mock = AsyncMock(side_effect=RuntimeError("boom"))
+    monkeypatch.setattr(
+        "record.daemon.naming.try_rename_session_folder", rename_mock
+    )
+
+    session_holder: list[_CombineFakeSession] = []
+
+    def _factory(
+        basename: Path, video_output_path: Path | None
+    ) -> _CombineFakeSession:
+        s = _CombineFakeSession(
+            basename=basename, video_output_path=video_output_path
+        )
+        session_holder.append(s)
+        return s
+
+    d = daemon.Daemon(
+        daemon_log_path=daemon_paths["log"],
+        session_factory=_factory,
+        output_folder=daemon_paths["root"],
+    )
+
+    background_snapshot: list[asyncio.Task[None]] = []
+
+    async def _drive() -> control.ControlResponse:
+        await d.handle_request(control.StartRequest())
+        resp = await d.handle_request(control.StopRequest())
+        background_snapshot.extend(
+            t for t in d._background if (t.get_name() or "").startswith("transcribe:")
+        )
+        await _drain_background(d)
+        return resp
+
+    resp = asyncio.run(_drive())
+    assert resp.status == "ok"
+    assert rename_mock.await_count == 1
+    assert d._state == daemon._CaptureState.IDLE
+    # Background task finished cleanly: no unhandled exception escaped.
+    for t in background_snapshot:
+        assert t.done()
+        assert t.exception() is None
 
 
 def test_no_api_key_skips_transcription_and_logs_warning(
@@ -1302,13 +1438,13 @@ def test_no_api_key_skips_transcription_and_logs_warning(
         f"expected exactly one `transcription_skipped` reason=no_api_key WARNING; "
         f"saw: {[r.getMessage() for r in caplog.records]!r}"
     )
-    # The audio path is the combined file (no -mic/-system suffix).
-    basename = session_holder[0].basename
-    combined_path = str(basename) + ".wav"
+    # Spec 008: the audio path is the combined file inside the session folder.
+    session_dir = session_holder[0].basename
+    combined_path = str(session_dir / "combined.wav")
     payload = matching[0].getMessage()
     assert combined_path in payload
-    assert "-mic.wav" not in payload
-    assert "-system.wav" not in payload
+    assert "mic.wav" not in payload
+    assert "system.wav" not in payload
 
 
 def test_transcription_failure_logged_no_exception_escapes(
@@ -1385,6 +1521,9 @@ def test_two_stops_in_quick_succession_produce_independent_tasks(
     _patch_transcription(monkeypatch, backends=[stub_a, stub_b])
     state_path = daemon_paths["root"] / "capture-state.json"
     monkeypatch.setattr(state, "_default_state_file", lambda: state_path)
+    # Spec 008: two starts in quick succession need distinct session-dir
+    # stems so the daemon's ``mkdir(exist_ok=False)`` succeeds each time.
+    _install_unique_timestamps(monkeypatch)
 
     session_holder: list[_CombineFakeSession] = []
 
@@ -1621,14 +1760,16 @@ class _CombineFakeSession(_FakeSession):
 
     async def start(self) -> None:
         await super().start()
+        # Spec 008: source WAVs live inside the per-session folder
+        # (``self.basename`` is the folder path).
         if self._write_mic:
             _write_int16_wav(
-                Path(str(self.basename) + "-mic.wav"),
+                self.basename / "mic.wav",
                 [100, 200, 300, 400, 500],
             )
         if self._write_system:
             _write_int16_wav(
-                Path(str(self.basename) + "-system.wav"),
+                self.basename / "system.wav",
                 [10, 20, 30, 40, 50],
             )
 
@@ -1672,7 +1813,8 @@ def test_handle_stop_combine_happy_path_persists_produced_state(
     combined = s.state.get("combined_audio")
     assert isinstance(combined, dict)
     assert combined.get("status") == "produced"
-    expected_path = Path(str(s.basename) + ".wav")
+    # Spec 008: combined WAV lands at ``<session_dir>/combined.wav``.
+    expected_path = s.basename / "combined.wav"
     assert combined.get("path") == str(expected_path)
     assert combined.get("duration_seconds") is not None
     # The combined file itself was written.
@@ -1744,9 +1886,9 @@ def test_handle_stop_combine_failure_persists_failed_state_and_logs(
     assert "CombineError" in msg
     assert "disk full" in msg
 
-    # Source WAVs survived the failure.
-    assert Path(str(s.basename) + "-mic.wav").is_file()
-    assert Path(str(s.basename) + "-system.wav").is_file()
+    # Source WAVs survived the failure (spec 008: inside the session folder).
+    assert (s.basename / "mic.wav").is_file()
+    assert (s.basename / "system.wav").is_file()
 
 
 def test_handle_stop_combine_missing_source_does_not_call_combine_wavs(
@@ -1901,8 +2043,9 @@ def test_combine_failure_skips_transcription_with_combine_failed_reason(
     # Zero backends were constructed — transcription was gated.
     assert handed_out == []
 
-    basename = session_holder[0].basename
-    combined_path = str(basename) + ".wav"
+    # Spec 008: the combined-file path is inside the session folder.
+    session_dir = session_holder[0].basename
+    combined_path = str(session_dir / "combined.wav")
 
     matching = [
         rec for rec in caplog.records
@@ -1915,8 +2058,10 @@ def test_combine_failure_skips_transcription_with_combine_failed_reason(
     )
     payload = matching[-1].getMessage()
     assert combined_path in payload
-    assert "-mic.wav" not in payload
-    assert "-system.wav" not in payload
+    # The per-source filenames must not appear in the skipped log — only the
+    # combined file is referenced for transcription.
+    assert "mic.wav" not in payload
+    assert "system.wav" not in payload
 
 
 def test_watch_for_system_event_stop_combine_failure_skips_transcription(
@@ -1965,8 +2110,9 @@ def test_watch_for_system_event_stop_combine_failure_skips_transcription(
     assert handed_out == []
     assert d._state == daemon._CaptureState.IDLE
 
-    basename = session_holder[0].basename
-    combined_path = str(basename) + ".wav"
+    # Spec 008: the combined-file path is inside the session folder.
+    session_dir = session_holder[0].basename
+    combined_path = str(session_dir / "combined.wav")
 
     matching = [
         rec for rec in caplog.records
@@ -1979,5 +2125,7 @@ def test_watch_for_system_event_stop_combine_failure_skips_transcription(
     )
     payload = matching[-1].getMessage()
     assert combined_path in payload
-    assert "-mic.wav" not in payload
-    assert "-system.wav" not in payload
+    # The per-source filenames must not appear in the skipped log — only the
+    # combined file is referenced for transcription.
+    assert "mic.wav" not in payload
+    assert "system.wav" not in payload
